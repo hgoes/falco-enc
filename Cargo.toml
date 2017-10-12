@@ -9,7 +9,7 @@ cpuprofiling = ["cpuprofiler"]
 
 [dependencies]
 smtrs = { git = "https://github.com/hguenther/smtrs" }
-llvm-ir = { git = "file:///home/eq/repos/llvm-ir" }
+llvm-ir = { git = "https://github.com/hguenther/llvm-ir" }
 symbolic-llvm = { git = "https://github.com/hguenther/symbolic-llvm" }
 clap = "2"
 serde = "1.0"
