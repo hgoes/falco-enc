@@ -50,7 +50,14 @@ pub struct Step<'a> {
     pub fun: &'a String,
     pub blk: usize,
     pub instr: usize,
-    pub ext: Option<External<'a>>
+    pub ext: CallKind<'a>
+}
+
+#[derive(Debug,PartialEq,Eq)]
+pub enum CallKind<'a> {
+    Internal,
+    Ignored,
+    External(External<'a>)
 }
 
 #[derive(Debug,PartialEq,Eq)]
@@ -124,7 +131,7 @@ named!(parse_type<Type>,
 named!(parse_string<Value>,do_parse!(char!('\"') >>
                                      res: parse_escaped >>
                                      char!('\"') >>
-                                     (Value::String(res.to_vec()))));
+                                     (Value::Bin(res.to_vec()))));
                                       
 named_args!(parse_int(bw: u64)<Value>,
             map!(map_opt!(digit,|v| BigUint::parse_bytes(v,10)),
@@ -132,8 +139,9 @@ named_args!(parse_int(bw: u64)<Value>,
 
 named!(parse_address<Value>,
        alt!(do_parse!(tag!("(nil)") >> (Value::Address(BigInt::from(0)))) |
-            map!(map_opt!(hex_digit,|v| BigInt::parse_bytes(v,16)),
-                 Value::Address)));
+            do_parse!(tag!("0x") >>
+                      val: map_opt!(hex_digit,|v| BigInt::parse_bytes(v,16)) >>
+                      (Value::Address(val)))));
 
 named!(parse_bin<Value>,
        map!(separated_list_complete!(ws,map_res!(map_res!(hex_digit,str::from_utf8),|s| u8::from_str_radix(s,16))),
@@ -180,16 +188,18 @@ named!(parse_element<Element>,
                                     digit >> ws >> // thread id
                                     tag!("---") >>
                                     (Element::BasicBlock(bid))) |
-                          do_parse!(char!('R') >> ws >>
+                          do_parse!(deref: opt!(char!('*')) >>
+                                    char!('R') >> ws >>
                                     tp: parse_type >> ws >>
                                     digit >> ws >> // thread id
                                     val: call!(parse_value,&tp) >>
-                                    (Element::CallReturn(false,val))) |
-                          do_parse!(char!('A') >> ws >>
+                                    (Element::CallReturn(deref.is_some(),val))) |
+                          do_parse!(deref: opt!(char!('*')) >>
+                                    char!('A') >> ws >>
                                     tp: parse_type >> ws >>
                                     digit >> ws >>
                                     val: call!(parse_value,&tp) >>
-                                    (Element::CallArgument(false,val))) |
+                                    (Element::CallArgument(deref.is_some(),val))) |
                           do_parse!(char!('E') >> ws >>
                                     tag!("---") >> ws >>
                                     tag!("---") >> ws >>
@@ -212,7 +222,7 @@ pub struct StepReader<'a,R> {
 pub struct ElementParser<R> {
     reader: R,
     buffer: Vec<u8>
-}                  
+}
 
 impl<'a,R : Read> StepReader<'a,R> {
     pub fn new(m: &'a llvm_ir::Module,spec: &'a FunSpecs,reader: R) -> (Vec<Vec<u8>>,Self) {
@@ -240,15 +250,15 @@ impl<'a,R : Read> StepReader<'a,R> {
     pub fn into_witnesses(mut self,nr: usize,wit: &mut Witnesses<'a>) -> () {
         for step in self {
             match step.ext {
-                None => {},
-                Some(ext) => match wit.entry(ext.function) {
+                CallKind::External(ext) => match wit.entry(ext.function) {
                     Entry::Occupied(mut occ) => {
                         occ.get_mut().push((nr,ext.args,ext.ret));
                     },
                     Entry::Vacant(vac) => {
                         vac.insert(vec![(nr,ext.args,ext.ret)]);
                     }
-                }
+                },
+                _ => {}
             }
         }
     }
@@ -273,10 +283,10 @@ impl<'a,R : Read> StepReader<'a,R> {
             }
         }
     }
-    fn get_spec(&self,name: &String) -> Option<&'a FunSpec> {
+    fn get_spec(&self,name: &String,has_ret: bool) -> Option<&'a FunSpec> {
         match name.as_ref() {
             "malloc" => None,
-            _ => self.spec.get(name)
+            _ => self.spec.get(name,has_ret)
         }
     }
 }
@@ -297,7 +307,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
             &llvm_ir::InstructionC::Call(_,_,ref rtp,ref called,ref args,_) => {
                 match called {
                     &llvm_ir::Value::Constant(llvm_ir::Constant::Global(ref name))
-                        => match self.get_spec(name) {
+                        => match self.get_spec(name,rtp.is_some()) {
                             None => match self.module.functions.get(name) {
                                 None => panic!("Function {} not found in module",name),
                                 Some(ref fun) => if fun.body.is_some() {
@@ -318,7 +328,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                                 fun: &cfun.name,
                                                 blk: cblk,
                                                 instr: cinstr,
-                                                ext: None })
+                                                ext: CallKind::Internal })
                                 } else {
                                     let cinstr = self.next_instr;
                                     self.next_instr+=1;
@@ -326,7 +336,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                                 fun: &cfun.name,
                                                 blk: self.next_block,
                                                 instr: cinstr,
-                                                ext: None })
+                                                ext: CallKind::Internal })
                                 }
                             },
                             Some(fspec) => {
@@ -356,9 +366,9 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                             fun: &cfun.name,
                                             blk: self.next_block,
                                             instr: cinstr,
-                                            ext: Some(External { function: name,
-                                                                 args: rargs,
-                                                                 ret: rret }) })
+                                            ext: CallKind::External(External { function: name,
+                                                                               args: rargs,
+                                                                               ret: rret }) })
                             }
                         },
                     _ => panic!("Function pointers not supported")
@@ -386,7 +396,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                     fun: &cfun.name,
                                     blk: cblk,
                                     instr: cinstr,
-                                    ext: None })
+                                    ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
                 }
@@ -408,7 +418,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                     fun: &cfun.name,
                                     blk: cblk,
                                     instr: cinstr,
-                                    ext: None })
+                                    ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
                 }
@@ -432,7 +442,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                     fun: &cfun.name,
                                     blk: cblk,
                                     instr: cinstr,
-                                    ext: None })
+                                    ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
                 }
@@ -451,7 +461,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                         fun: &cfun.name,
                                         blk: cblk,
                                         instr: cinstr,
-                                        ext: None })
+                                        ext: CallKind::Internal })
                         }
                     }
                 }
@@ -463,7 +473,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             fun: &cfun.name,
                             blk: self.next_block,
                             instr: cinstr,
-                            ext: None })
+                            ext: CallKind::Internal })
             }
         }
     }
@@ -561,6 +571,13 @@ impl<R : Read> ElementParser<R> {
                         },
                         r => panic!("Unexpected value {:#?}, expected int",r)
                     },
+                &llvm_ir::types::Type::Pointer(_,_) => match self.get_value(is_ret) {
+                    (false,Value::Address(addr)) => match self.get_value(is_ret) {
+                        (true,Value::Bin(cont)) => Some(Val::Mem { address: addr, content: cont }),
+                        el => panic!("Unexpected value {:#?}, expected bin",el)
+                    },
+                    el => panic!("Unexpected value {:#?}, expected address",el)
+                },
                 _ => panic!("Don't know how to trace {:#?}",*tp)
             }
         }
@@ -576,7 +593,7 @@ impl<R : Read> Iterator for ElementParser<R> {
                 IResult::Incomplete(_) => None,
                 IResult::Error(err) => {
                     let limit = min(120,self.buffer.len());
-                    panic!("Cannot parse entry: {}; {:?}",err,&self.buffer[0..limit])
+                    panic!("Cannot parse entry: {}; {}",err,str::from_utf8(&self.buffer[0..limit]).unwrap())
                 }
             };
             if let Some((rest_sz,el)) = res {

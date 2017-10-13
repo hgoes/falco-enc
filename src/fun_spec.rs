@@ -131,9 +131,43 @@ pub struct FunSpec {
     pub ret: Option<TraceSpec>
 }
 
-pub type FunSpecs = HashMap<String,FunSpec>;
+pub struct FunSpecs {
+    specs: HashMap<String,FunSpec>,
+    ignored: FunSpec,
+    ignored_ret: FunSpec
+}
 
-pub fn read_funspecs(file: &str) -> FunSpecs {
-    let reader = File::open(file).expect("Failed to open function specification file");
-    from_reader(reader).unwrap()
+impl FunSpecs {
+    pub fn empty() -> Self {
+        FunSpecs { specs: HashMap::new(),
+                   ignored: FunSpec { is_variadic: false,
+                                      args: vec![],
+                                      ret: None },
+                   ignored_ret: FunSpec { is_variadic: false,
+                                          args: vec![],
+                                          ret: Some(TraceSpec::Std) }
+        }
+    }
+    pub fn read(file: &str) -> Self {
+        let reader = File::open(file).expect("Failed to open function specification file");
+        FunSpecs { specs: from_reader(reader).unwrap(),
+                   ignored: FunSpec { is_variadic: false,
+                                      args: vec![],
+                                      ret: None },
+                   ignored_ret: FunSpec { is_variadic: false,
+                                          args: vec![],
+                                          ret: Some(TraceSpec::Std) }
+        }
+    }
+    pub fn get<'a>(&'a self,name: &String,has_ret: bool) -> Option<&'a FunSpec> {
+        if name.starts_with("__falco_ignore") {
+            if has_ret {
+                Some(&self.ignored_ret)
+            } else {
+                Some(&self.ignored)
+            }
+        } else {
+            self.specs.get(name)
+        }
+    }
 }

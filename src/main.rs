@@ -561,7 +561,7 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b
         if *fname!=*self.ext.function {
             return Ok(false)
         }
-        assert!(self.ext.args.iter().all(Option::is_none));
+        //assert!(self.ext.args.iter().all(Option::is_none));
         match self.ext.ret {
             None => {}
             Some(ref rval) => match rval {
@@ -578,6 +578,28 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b
                 _ => unimplemented!()
             }
         }
+        Ok(true)
+    }
+}
+
+struct FalcoIgnore {}
+
+impl<'a,V : 'a+Bytes+FromConst<'a>> Library<'a,V> for FalcoIgnore {
+    fn call<RetV,Em : DeriveValues>(&self,
+                                    fname: &'a String,
+                                    args: &Vec<V>,
+                                    args_inp: Transf<Em>,
+                                    ret_view: Option<RetV>,
+                                    dl: &'a DataLayout,
+                                    instr_id: InstructionRef<'a>,
+                                    conds: &mut Vec<Transf<Em>>,
+                                    prog: &Program<'a,V>,
+                                    prog_inp: Transf<Em>,
+                                    nprog: &mut Program<'a,V>,
+                                    updates: &mut Updates<Em>,
+                                    exprs: &[Em::Expr],
+                                    em: &mut Em)
+                                    -> Result<bool,Em::Error> {
         Ok(true)
     }
 }
@@ -664,6 +686,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             }
         };
         //println!("Next step: {:#?}",entr);
+        debug!(self,4,"Step: {:#?}",entr);
         let thr_id = (None,self.main);
         let fun = self.module.functions.get(entr.fun).expect("Function not found");
         let (instr,instr_ref) = match fun.body {
@@ -700,7 +723,20 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
         };
         let (mut nprog,ninp,nprog_inp,act,mut ndom,ndomFull)
             = match entr.ext {
-                None => {
+                falco::CallKind::Ignored => {
+                    let lib = FalcoIgnore {};
+                    step(self.module,&lib,&self.program,
+                         if use_full {
+                             &self.domain_full
+                         } else {
+                             &self.domain
+                         },
+                         &self.domain,
+                         &self.domain_full,
+                         thr_id,entr.call_id,instr_ref,
+                         self.debugging)
+                },
+                falco::CallKind::Internal => {
                     let lib = StdLib {};
                     step(self.module,&lib,&self.program,
                          if use_full {
@@ -713,7 +749,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          thr_id,entr.call_id,instr_ref,
                          self.debugging)
                 },
-                Some(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
+                falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
                     step(self.module,&lib,&self.program,
                          if use_full {
@@ -854,8 +890,8 @@ fn main() {
     let entry_fun = m.functions.get(&entry).expect("Cannot find entry function");
     let debugging = args.occurrences_of("debug");
     let fun_spec = match args.value_of("fun_spec") {
-        None => HashMap::new(),
-        Some(file) => fun_spec::read_funspecs(file)
+        None => fun_spec::FunSpecs::empty(),
+        Some(file) => fun_spec::FunSpecs::read(file)
     };
     let mut p = Pipe::new(io::empty(),io::stdout());
     let selectors = make_selectors(&m,&mut p).unwrap();
