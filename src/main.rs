@@ -4,7 +4,6 @@ extern crate llvm_ir;
 extern crate symbolic_llvm;
 extern crate smtrs;
 extern crate serde;
-#[macro_use]
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
@@ -16,7 +15,7 @@ extern crate cpuprofiler;
 mod fun_spec;
 mod falco;
 
-use llvm_ir::{Module,Instruction,Metadata,parse_module};
+use llvm_ir::{Module,Instruction,parse_module};
 use symbolic_llvm::symbolic::llvm::*;
 use symbolic_llvm::symbolic::llvm::program::*;
 use symbolic_llvm::symbolic::llvm::pointer::*;
@@ -29,17 +28,14 @@ use smtrs::composite::*;
 use smtrs::embed::{Embed,DeriveConst,DeriveValues};
 use smtrs::backend::{Backend,Pipe};
 use smtrs::domain::*;
-use smtrs::unique::Uniquer;
 use smtrs::expr as expr;
 use smtrs::types as types;
-use std::fmt::{Debug,Display,format};
-use std::fmt;
+use std::fmt::{Debug,Display};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io;
-use std::iter::Peekable;
-use num_bigint::{BigInt,BigUint};
+use num_bigint::BigUint;
 use std::mem::{swap,replace};
 #[cfg(feature="cpuprofiling")]
 use cpuprofiler::PROFILER;
@@ -72,7 +68,7 @@ impl<A : Composite+Clone,B : Composite+Clone,DomA : Domain<A>,DomB : Domain<B>> 
         }
         self.dom2.intersection(&oth.dom2)
     }
-    fn derive<Em : Embed,F>(&self,exprs: &[Em::Expr],em: &mut Em,f: &F)
+    fn derive<Em : Embed,F>(&self,_: &[Em::Expr],_: &mut Em,_: &F)
                             -> Result<Self,Em::Error>
         where F : Fn(&Em::Var) -> Option<usize> {
         unimplemented!()
@@ -206,13 +202,13 @@ impl<'a,'b,V,DomProg,DomInp> Embed for CompProgram<'a,'b,V,DomProg,DomInp>
             self.inp.elem_sort(var.0-prog_sz,self)
         }
     }
-    fn type_of_fun(&mut self,fun:&Self::Fun) -> Result<Self::Sort,Self::Error> {
+    fn type_of_fun(&mut self,_:&Self::Fun) -> Result<Self::Sort,Self::Error> {
         unreachable!()
     }
-    fn arity(&mut self,fun:&Self::Fun) -> Result<usize,Self::Error> {
+    fn arity(&mut self,_:&Self::Fun) -> Result<usize,Self::Error> {
         unreachable!()
     }
-    fn type_of_arg(&mut self,fun:&Self::Fun,p:usize) -> Result<Self::Sort,Self::Error> {
+    fn type_of_arg(&mut self,_:&Self::Fun,_:usize) -> Result<Self::Sort,Self::Error> {
         unreachable!()
     }
 }
@@ -284,7 +280,7 @@ impl<Em : Embed> FalcoCfg<Em> {
         FalcoCfg { paths: Some(Vec::new()),
                    current_path: Vec::new() }
     }
-    pub fn condition(mut self,em: &mut Em)
+    pub fn condition(self,em: &mut Em)
                      -> Result<Option<Transf<Em>>,Em::Error> {
         match self.paths {
             None => Ok(None),
@@ -321,7 +317,7 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
     }
     fn change_instr_activation(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
         -> Result<(),Em::Error> {
         self.current_path.extend(conds.drain(pos..));
         let mut path = replace(&mut self.current_path,Vec::new());
@@ -346,27 +342,15 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
     }
 }
 
-fn translate_init_<'a,'b,Em>(module: &'a Module,
-                             entry_fun: &'a String,
-                             args: Vec<Val<'a>>,
-                             inp_args: Transf<Em>,
-                             aux: Vec<Vec<u8>>,
-                             em: &mut Em)
-                             -> Result<(OptRef<'b,Program<'a,Val<'a>>>,Transf<Em>),Em::Error>
-    where Em : Embed {
-    translate_init(module,entry_fun,args,inp_args,aux,em)
-}
-
 fn step<'a,Lib,V,Dom>(m: &'a Module,
                       lib: &Lib,
                       st: &Program<'a,V>,
-                      domainUse: &Dom,
-                      domainDerive1: &Dom,
-                      domainDerive2: &Dom,
+                      domain_use: &Dom,
+                      domain_derive1: &Dom,
+                      domain_derive2: &Dom,
                       thread_id: ThreadId<'a>,
                       cf_id: CallId<'a>,
-                      instr_id: InstructionRef<'a>,
-                      debugging: u64)
+                      instr_id: InstructionRef<'a>)
                       -> (Program<'a,V>,ProgramInput<'a,V>,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Option<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
@@ -377,7 +361,6 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
           Lib : Library<'a,V> {
 
     let instr = instr_id.resolve(m);
-    let next_instr_id = instr_id.next();
     let prog_size = st.num_elem();
 
     let mut inp = ProgramInput::new();
@@ -386,7 +369,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
     {
         let mut comp = CompProgram { prog: st,
                                      inp: &inp,
-                                     dom_prog: domainUse,
+                                     dom_prog: domain_use,
                                      dom_inp: &dom_inp };
         for i in 0..prog_size {
             exprs.push(comp.var(CompVar(i)).unwrap());
@@ -398,7 +381,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
         let ninp = {
             let mut comp = CompProgram { prog: st,
                                          inp: &inp,
-                                         dom_prog: domainUse,
+                                         dom_prog: domain_use,
                                          dom_inp: &dom_inp };
             let inp_size = inp.num_elem();
             
@@ -437,18 +420,18 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                         }
                     }
                     let (ndom1,ndom2) = {
-                        let d1 = domainDerive1.derive(&nexprs[..],&mut comp,
-                                                      &|v| if v.0 < prog_size {
-                                                          Some(v.0)
-                                                      } else {
-                                                          panic!("Input vars?")//None
-                                                      }).unwrap();
-                        let d2 = domainDerive2.derive(&nexprs[..],&mut comp,
-                                                      &|v| if v.0 < prog_size {
-                                                          Some(v.0)
-                                                      } else {
-                                                          panic!("Input vars?")//None
-                                                      }).unwrap();
+                        let d1 = domain_derive1.derive(&nexprs[..],&mut comp,
+                                                       &|v| if v.0 < prog_size {
+                                                           Some(v.0)
+                                                       } else {
+                                                           panic!("Input vars?")//None
+                                                       }).unwrap();
+                        let d2 = domain_derive2.derive(&nexprs[..],&mut comp,
+                                                       &|v| if v.0 < prog_size {
+                                                           Some(v.0)
+                                                       } else {
+                                                           panic!("Input vars?")//None
+                                                       }).unwrap();
                         (d1,d2)
                     };
                     if cfg!(debug_assertions) {
@@ -488,7 +471,7 @@ fn get_dbg_loc(instr: &Instruction,m: &Module) -> Option<(u64,u64)> {
 
 fn make_selectors<B : Backend>(m: &Module,b: &mut B) -> Result<Selectors<B>,B::Error> {
     let mut selectors = HashMap::new();
-    for (fun_name,fun) in m.functions.iter() {
+    for fun in m.functions.values() {
         if let Some(ref bdy) = fun.body {
             for blk in bdy.iter() {
                 for instr in blk.instrs.iter() {
@@ -544,17 +527,17 @@ struct FalcoLib<'a : 'b,'b> {
 impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b> {
     fn call<RetV,Em : DeriveValues>(&self,
                                     fname: &'a String,
-                                    args: &Vec<V>,
-                                    args_inp: Transf<Em>,
+                                    _: &Vec<V>,
+                                    _: Transf<Em>,
                                     ret_view: Option<RetV>,
-                                    dl: &'a DataLayout,
-                                    instr_id: InstructionRef<'a>,
+                                    _: &'a DataLayout,
+                                    _: InstructionRef<'a>,
                                     conds: &mut Vec<Transf<Em>>,
-                                    prog: &Program<'a,V>,
+                                    _: &Program<'a,V>,
                                     prog_inp: Transf<Em>,
                                     nprog: &mut Program<'a,V>,
                                     updates: &mut Updates<Em>,
-                                    exprs: &[Em::Expr],
+                                    _: &[Em::Expr],
                                     em: &mut Em)
                                     -> Result<bool,Em::Error>
         where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
@@ -582,28 +565,6 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b
     }
 }
 
-struct FalcoIgnore {}
-
-impl<'a,V : 'a+Bytes+FromConst<'a>> Library<'a,V> for FalcoIgnore {
-    fn call<RetV,Em : DeriveValues>(&self,
-                                    fname: &'a String,
-                                    args: &Vec<V>,
-                                    args_inp: Transf<Em>,
-                                    ret_view: Option<RetV>,
-                                    dl: &'a DataLayout,
-                                    instr_id: InstructionRef<'a>,
-                                    conds: &mut Vec<Transf<Em>>,
-                                    prog: &Program<'a,V>,
-                                    prog_inp: Transf<Em>,
-                                    nprog: &mut Program<'a,V>,
-                                    updates: &mut Updates<Em>,
-                                    exprs: &[Em::Expr],
-                                    em: &mut Em)
-                                    -> Result<bool,Em::Error> {
-        Ok(true)
-    }
-}
-
 impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwinding<'a,R,Em,V,Dom>
     where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Debug+Semantic, Em::Expr : Display {
     pub fn new(inp: R,
@@ -622,7 +583,6 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             None => panic!("Function {} not found in module",fun),
             Some(rfun) => if rfun.arguments.len()==2 {
                 let argc_tp = &rfun.arguments[0].1;
-                let argv_tp = &rfun.arguments[1].1;
                 match argc_tp {
                     &llvm_ir::types::Type::Int(w) => w,
                     _ => panic!("First parameter of {} function should be an int, but is {:?}",
@@ -671,12 +631,6 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                             path: Vec::new(),
                             debugging: debug })
     }
-    fn debug<F>(&mut self,level: u64,outp: F) -> ()
-        where F : FnOnce() -> String {
-        if level >= self.debugging {
-            self.backend.comment(outp().as_ref()).expect("Failed to add comment")
-        }
-    }
     fn step<'b>(&'b mut self) -> bool {
         let entr = match self.step_buffer.take() {
             Some(s) => s,
@@ -721,21 +675,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             llvm_ir::InstructionC::GEP(_,_) => true,
             _ => false
         };
-        let (mut nprog,ninp,nprog_inp,act,mut ndom,ndomFull)
+        let (mut nprog,ninp,nprog_inp,act,mut ndom,ndom_full)
             = match entr.ext {
-                falco::CallKind::Ignored => {
-                    let lib = FalcoIgnore {};
-                    step(self.module,&lib,&self.program,
-                         if use_full {
-                             &self.domain_full
-                         } else {
-                             &self.domain
-                         },
-                         &self.domain,
-                         &self.domain_full,
-                         thr_id,entr.call_id,instr_ref,
-                         self.debugging)
-                },
                 falco::CallKind::Internal => {
                     let lib = StdLib {};
                     step(self.module,&lib,&self.program,
@@ -746,8 +687,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref,
-                         self.debugging)
+                         thr_id,entr.call_id,instr_ref)
                 },
                 falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
@@ -759,8 +699,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref,
-                         self.debugging)
+                         thr_id,entr.call_id,instr_ref)
                 } else {
                     let lib = FalcoLib { ext: ext };
                     step(self.module,&lib,&self.program,
@@ -771,8 +710,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref,
-                         self.debugging)
+                         thr_id,entr.call_id,instr_ref)
                 }
             };
         let num_inp = ninp.num_elem();
@@ -798,7 +736,6 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             Some(l) => Some(self.selectors.get(&l).expect("Selector not found"))
         };
         swap(&mut self.program,&mut nprog);
-        let old_program = nprog;
         let mut old_semantics = Vec::with_capacity(nprogram_input.len());
         swap(&mut self.program_meaning,&mut old_semantics);
         match self.program.first_meaning() {
@@ -862,7 +799,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
         }
         self.program_input = nprogram_input;
         self.domain = ndom;
-        self.domain_full = ndomFull;
+        self.domain_full = ndom_full;
         true
     }
 }
@@ -875,7 +812,6 @@ fn main() {
                          (author: "Henning Günther <guenther@forsyte.at>")
                          (about: "Encodes a falco trace into an SMT instance")
                          (@arg fun_spec: -f --fun_spec <FILE> !required +takes_value "Use a tracing specification file")
-                         (@arg entry: -e --entry <FUN> !required +takes_value "Use a function other than main as entry point")
                          (@arg debug: -d --debug !required +multiple "Add extra debugging information to the trace")
                          (@arg llvm_file: +required "The LLVM file")
                          (@arg trace: +required +multiple "The trace file")
@@ -886,8 +822,6 @@ fn main() {
     let llvm_file = args.value_of("llvm_file").unwrap();
     let m = parse_module(llvm_file).expect("Cannot parse llvm module");
     //println!("Module: {:#?}",m);
-    let entry = args.value_of("entry").unwrap_or("main").to_string();
-    let entry_fun = m.functions.get(&entry).expect("Cannot find entry function");
     let debugging = args.occurrences_of("debug");
     let fun_spec = match args.value_of("fun_spec") {
         None => fun_spec::FunSpecs::empty(),
@@ -912,32 +846,4 @@ fn main() {
     }
     #[cfg(feature="cpuprofiling")]
     PROFILER.lock().unwrap().stop().unwrap();
-    /*let (prog,prog_dom) = {
-        let prev = ();
-        let mut uniq = Uniquer::new();
-        let mut comp = Comp { referenced: &prev,
-                              exprs: &mut uniq };
-        let (ref_prog,init) = translate_init_(&m,&entry,vec![],Transformation::id(0),&mut comp).unwrap();
-        let init_exprs = init.get_all(&[][..],&mut comp).unwrap();
-        // FIXME: This should reference (), but that is not possible in Rust
-        let dom_none : AttributeDomain<Const> = AttributeDomain::full(ref_prog.as_ref());
-        let dom_init = <AttributeDomain<Const> as Domain<Program<Val>>>::derive(&dom_none,&init_exprs,&mut comp,
-                                       &|_| { unreachable!() }).unwrap();
-        (ref_prog.as_obj(),dom_init)
-    };
-
-    println!("Initial domain: {:#?}",prog_dom);
-    
-    let thread_id = (None,&entry);
-    let cf_id = (None,&entry);
-    let start = InstructionRef::entry(entry_fun);
-    let (nprog,ninp,exprs,ndom) = step(&m,&prog,&prog_dom,thread_id,cf_id,start);
-    println!("Program: {:#?}",nprog);
-    for (n,e) in exprs.iter().enumerate() {
-        println!("Expr {}: {}",n,e);
-    }
-    println!("Domain: {:#?}",ndom);
-    for v in nprog.data_vars() {
-        println!("Data var: {}",v)
-    }*/
 }

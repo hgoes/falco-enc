@@ -12,7 +12,6 @@ use std::collections::hash_map::{HashMap,Entry};
 
 #[derive(Debug,PartialEq,Eq)]
 pub enum Value {
-    String(Vec<u8>),
     Int { bw: u64, val: BigUint },
     Address(BigInt),
     Bin(Vec<u8>)
@@ -56,7 +55,6 @@ pub struct Step<'a> {
 #[derive(Debug,PartialEq,Eq)]
 pub enum CallKind<'a> {
     Internal,
-    Ignored,
     External(External<'a>)
 }
 
@@ -230,7 +228,7 @@ impl<'a,R : Read> StepReader<'a,R> {
         let (mapping,nargs) = parser.get_mapping();
         let args = parser.get_args(nargs);
         let fun = {
-            let &(ref blk_id,ref fun_id) = match parser.next() {
+            let &(_,ref fun_id) = match parser.next() {
                 None => panic!("Unexpected end of trace"),
                 Some(Element::BasicBlock(n)) => &mapping[n-1],
                 Some(el) => panic!("Unexpected element: {:#?}",el)
@@ -238,7 +236,6 @@ impl<'a,R : Read> StepReader<'a,R> {
             m.functions.get(fun_id)
                 .expect("Entry function not found in module")
         };
-        let entry = InstructionRef::entry(fun);
         (args,StepReader { module: m,
                            spec: spec,
                            parser: parser,
@@ -247,7 +244,7 @@ impl<'a,R : Read> StepReader<'a,R> {
                            next_block: 0,
                            next_instr: 0 })
     }
-    pub fn into_witnesses(mut self,nr: usize,wit: &mut Witnesses<'a>) -> () {
+    pub fn into_witnesses(self,nr: usize,wit: &mut Witnesses<'a>) -> () {
         for step in self {
             match step.ext {
                 CallKind::External(ext) => match wit.entry(ext.function) {
@@ -314,7 +311,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                     match self.parser.next() {
                                         None => panic!("Unexpected end of trace"),
                                         Some(Element::BasicBlock(n)) => {
-                                            let (ref blk_name,ref fun_name) = self.mapping[n-1];
+                                            let (_,ref fun_name) = self.mapping[n-1];
                                             assert_eq!(*fun_name,fun.name);
                                         },
                                         Some(el) => panic!("Unexpected element: {:#?}",el)
@@ -383,7 +380,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                 match self.parser.next() {
                     None => None,
                     Some(Element::BasicBlock(n)) => {
-                        let (ref blk_name,ref fun_name) = self.mapping[n-1];
+                        let (ref blk_name,_) = self.mapping[n-1];
                         assert_eq!(*trg,*blk_name);
                         let cblk = self.next_block;
                         let cinstr = self.next_instr;
@@ -401,12 +398,12 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                     Some(el) => panic!("Unexpected element: {:#?}",el)
                 }
             },
-            &llvm_ir::InstructionC::Term(llvm_ir::Terminator::BrC(_,ref trgT,ref trgF)) => {
+            &llvm_ir::InstructionC::Term(llvm_ir::Terminator::BrC(_,ref trg_t,ref trg_f)) => {
                 match self.parser.next() {
                     None => None,
                     Some(Element::BasicBlock(n)) => {
-                        let (ref blk_name,ref fun_name) = self.mapping[n-1];
-                        assert!(*trgT==*blk_name || *trgF==*blk_name);
+                        let (ref blk_name,_) = self.mapping[n-1];
+                        assert!(*trg_t==*blk_name || *trg_f==*blk_name);
                         let cblk = self.next_block;
                         let cinstr = self.next_instr;
                         self.next_block = match cfun.body {
@@ -427,7 +424,7 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                 match self.parser.next() {
                     None => None,
                     Some(Element::BasicBlock(n)) => {
-                        let (ref blk_name,ref fun_name) = self.mapping[n-1];
+                        let (ref blk_name,_) = self.mapping[n-1];
                         if *def!=*blk_name {
                             assert!(trgs.iter().find(|&&(_,ref trg)| *trg==*blk_name).is_some())
                         }
@@ -528,7 +525,7 @@ impl<R : Read> ElementParser<R> {
     }
     pub fn get_args(&mut self,num: usize) -> Vec<Vec<u8>> {
         let mut res = Vec::with_capacity(num);
-        for i in 0..num {
+        for _ in 0..num {
             match self.next() {
                 None => panic!("Unexpected end of trace"),
                 Some(Element::MainArgument(arg)) => res.push(arg),
@@ -562,7 +559,7 @@ impl<R : Read> ElementParser<R> {
                -> Option<Val> {
         match spec {
             &None => None,
-            &Some(ref rspec) => match tp {
+            &Some(_) => match tp {
                 &llvm_ir::types::Type::Int(bw_)
                     => match self.get_value(is_ret) {
                         (false,Value::Int { bw, val }) => {

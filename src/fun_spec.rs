@@ -1,4 +1,4 @@
-use serde::{Serialize,Deserialize};
+use serde::Deserialize;
 use serde_json::{from_reader};
 use serde::de::*;
 use std::fs::File;
@@ -61,6 +61,13 @@ impl<'de> Deserialize<'de> for LengthSpec {
                         },
                         None => Err(Error::invalid_length(1,&"3"))
                     },
+                    Some(Field::Sub) => match seq.next_element()? {
+                        Some(lhs) => match seq.next_element()? {
+                            Some(rhs) => Ok(LengthSpec::Op(LengthOp::Sub,lhs,rhs)),
+                            None => Err(Error::invalid_length(2,&"3"))
+                        },
+                        None => Err(Error::invalid_length(1,&"3"))
+                    },
                     Some(Field::Mul) => match seq.next_element()? {
                         Some(lhs) => match seq.next_element()? {
                             Some(rhs) => Ok(LengthSpec::Op(LengthOp::Mul,lhs,rhs)),
@@ -68,7 +75,13 @@ impl<'de> Deserialize<'de> for LengthSpec {
                         },
                         None => Err(Error::invalid_length(1,&"3"))
                     },
-                    _ => unimplemented!()
+                    Some(Field::Div) => match seq.next_element()? {
+                        Some(lhs) => match seq.next_element()? {
+                            Some(rhs) => Ok(LengthSpec::Op(LengthOp::Div,lhs,rhs)),
+                            None => Err(Error::invalid_length(2,&"3"))
+                        },
+                        None => Err(Error::invalid_length(1,&"3"))
+                    }
                 }
             }
         }
