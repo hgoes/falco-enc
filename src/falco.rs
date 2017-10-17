@@ -164,7 +164,7 @@ named!(parse_element<Element>,
                  el: alt!(do_parse!(char!('I') >> ws >>
                                     // Block id also denotes the length of name, ignore
                                     blk_id: parse_usize >> char!('x') >> digit >> ws >>
-                                    digit >> ws >> // Thread id
+                                    is_not!(" \t") >> ws >> // Thread id
                                     char!('\"') >>
                                     blk_name: map_res!(is_not!("\"@"),str::from_utf8) >>
                                     char!('@') >>
@@ -175,31 +175,31 @@ named!(parse_element<Element>,
                                                                 String::from(fun_name)))) |
                           do_parse!(char!('C') >> ws >>
                                     tag!("i32") >> ws >>
-                                    digit >> ws >> // thread id
+                                    is_not!(" \t") >> ws >> // thread id
                                     n: parse_usize >>
                                     (Element::MainArgumentCount(n))) |
                           do_parse!(char!('V') >> ws >>
                                     tag!("i8x") >> digit >> ws >> // length of the argument
-                                    digit >> ws >> // thread id
+                                    is_not!(" \t") >> ws >> // thread id
                                     char!('\"') >>
                                     arg: parse_escaped >>
                                     char!('\"') >>
                                     (Element::MainArgument(arg))) |
                           do_parse!(char!('B') >> ws >>
                                     bid: parse_usize >> ws >>
-                                    digit >> ws >> // thread id
+                                    is_not!(" \t") >> ws >> // thread id
                                     tag!("---") >>
                                     (Element::BasicBlock(bid))) |
                           do_parse!(deref: opt!(char!('*')) >>
                                     char!('R') >> ws >>
                                     tp: parse_type >> ws >>
-                                    digit >> ws >> // thread id
+                                    is_not!(" \t") >> ws >> // thread id
                                     val: call!(parse_value,&tp) >>
                                     (Element::CallReturn(deref.is_some(),val))) |
                           do_parse!(deref: opt!(char!('*')) >>
                                     char!('A') >> ws >>
                                     tp: parse_type >> ws >>
-                                    digit >> ws >>
+                                    is_not!(" \t") >> ws >>
                                     val: call!(parse_value,&tp) >>
                                     (Element::CallArgument(deref.is_some(),val))) |
                           do_parse!(char!('E') >> ws >>
