@@ -150,6 +150,47 @@ pub struct FunSpecs {
     ignored_ret: FunSpec
 }
 
+pub enum OptFunSpec<'a> {
+    Spec(&'a FunSpec),
+    Default(bool,bool),
+    Ignore
+}
+
+static OPT_TRACE_SPEC_STD : Option<TraceSpec> = Some(TraceSpec::Std);
+static OPT_TRACE_SPEC_NONE : Option<TraceSpec> = None;
+
+impl<'a> OptFunSpec<'a> {
+    pub fn is_variadic(&self) -> bool {
+        match self {
+            &OptFunSpec::Spec(sp) => sp.is_variadic,
+            &OptFunSpec::Default(variadic,_) => variadic,
+            &OptFunSpec::Ignore => false
+        }
+    }
+    pub fn arg(&self,p: usize) -> &'a Option<TraceSpec> {
+        match self {
+            &OptFunSpec::Spec(sp) => if p < sp.args.len() {
+                &sp.args[p]
+            } else {
+                &OPT_TRACE_SPEC_NONE
+            },
+            &OptFunSpec::Default(_,_) => &OPT_TRACE_SPEC_STD,
+            &OptFunSpec::Ignore => &OPT_TRACE_SPEC_NONE
+        }
+    }
+    pub fn ret(&self) -> &'a Option<TraceSpec> {
+        match self {
+            &OptFunSpec::Spec(sp) => &sp.ret,
+            &OptFunSpec::Default(_,has_ret) => if has_ret {
+                &OPT_TRACE_SPEC_STD
+            } else {
+                &OPT_TRACE_SPEC_NONE
+            },
+            &OptFunSpec::Ignore => &OPT_TRACE_SPEC_NONE
+        }
+    }
+}
+
 impl FunSpecs {
     pub fn empty() -> Self {
         FunSpecs { specs: HashMap::new(),
@@ -172,15 +213,17 @@ impl FunSpecs {
                                           ret: Some(TraceSpec::Std) }
         }
     }
-    pub fn get<'a>(&'a self,name: &String,has_ret: bool) -> Option<&'a FunSpec> {
-        if name.starts_with("__falco_ignore") {
-            if has_ret {
-                Some(&self.ignored_ret)
+    pub fn get<'a>(&'a self,
+                   name: &String,
+                   variadic: bool,
+                   has_ret: bool) -> OptFunSpec<'a> {
+        match self.specs.get(name) {
+            Some(r) => OptFunSpec::Spec(r),
+            None => if name.starts_with("llvm.dbg.") {
+                OptFunSpec::Ignore
             } else {
-                Some(&self.ignored)
+                OptFunSpec::Default(variadic,has_ret)
             }
-        } else {
-            self.specs.get(name)
         }
     }
 }

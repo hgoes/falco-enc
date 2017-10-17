@@ -578,7 +578,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             None => panic!("Trace must have at least one element"),
             Some(step) => step
         };
-        let fun = step0.fun;
+        let fun = step0.id.fun;
         let argc_bw = match m.functions.get(fun) {
             None => panic!("Function {} not found in module",fun),
             Some(rfun) => if rfun.arguments.len()==2 {
@@ -642,15 +642,16 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
         //println!("Next step: {:#?}",entr);
         debug!(self,4,"Step: {:#?}",entr);
         let thr_id = (None,self.main);
-        let fun = self.module.functions.get(entr.fun).expect("Function not found");
+        let fun = self.module.functions.get(entr.id.fun)
+            .expect("Function not found");
         let (instr,instr_ref) = match fun.body {
             None => panic!("Function has no body"),
             Some(ref blks) => {
-                let blk = &blks[entr.blk];
-                (&blk.instrs[entr.instr],
+                let blk = &blks[entr.id.blk];
+                (&blk.instrs[entr.id.instr],
                  InstructionRef { function: &fun.name,
                                   basic_block: &blk.name,
-                                  instruction: entr.instr })
+                                  instruction: entr.id.instr })
             }
         };
         debug!(self,1,"Instruction {}.{}.{}",
@@ -687,7 +688,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref)
                 },
                 falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
@@ -699,7 +700,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref)
                 } else {
                     let lib = FalcoLib { ext: ext };
                     step(self.module,&lib,&self.program,
@@ -710,7 +711,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref)
                 }
             };
         let num_inp = ninp.num_elem();

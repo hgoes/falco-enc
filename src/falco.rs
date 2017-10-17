@@ -36,19 +36,23 @@ pub enum Element {
     End
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq,Clone)]
 pub enum Val {
     Int { bw: u64, val: BigUint },
     Mem { address: BigInt, content: Vec<u8> }
 }
-    
 
-#[derive(Debug,PartialEq,Eq)]
-pub struct Step<'a> {
+#[derive(Debug,PartialEq,Eq,Hash,Clone)]
+pub struct StepId<'a> {
     pub call_id: CallId<'a>,
     pub fun: &'a String,
     pub blk: usize,
-    pub instr: usize,
+    pub instr: usize
+}
+
+#[derive(Debug,PartialEq,Eq)]
+pub struct Step<'a> {
+    pub id: StepId<'a>,
     pub ext: CallKind<'a>
 }
 
@@ -58,7 +62,7 @@ pub enum CallKind<'a> {
     External(External<'a>)
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq,Clone)]
 pub struct External<'a> {
     pub function: &'a String,
     pub args: Vec<Option<Val>>,
@@ -280,12 +284,6 @@ impl<'a,R : Read> StepReader<'a,R> {
             }
         }
     }
-    fn get_spec(&self,name: &String,has_ret: bool) -> Option<&'a FunSpec> {
-        match name.as_ref() {
-            "malloc" => None,
-            _ => self.spec.get(name,has_ret)
-        }
-    }
 }
 
 impl<'a,R : Read> Iterator for StepReader<'a,R> {
@@ -303,71 +301,68 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
         match &instr.content {
             &llvm_ir::InstructionC::Call(_,_,ref rtp,ref called,ref args,_) => {
                 match called {
-                    &llvm_ir::Value::Constant(llvm_ir::Constant::Global(ref name))
-                        => match self.get_spec(name,rtp.is_some()) {
-                            None => match self.module.functions.get(name) {
-                                None => panic!("Function {} not found in module",name),
-                                Some(ref fun) => if fun.body.is_some() {
-                                    match self.parser.next() {
-                                        None => panic!("Unexpected end of trace"),
-                                        Some(Element::BasicBlock(n)) => {
-                                            let (_,ref fun_name) = self.mapping[n-1];
-                                            assert_eq!(*fun_name,fun.name);
-                                        },
-                                        Some(el) => panic!("Unexpected element: {:#?}",el)
-                                    }
-                                    self.stack.push((&fun.name,self.next_block,self.next_instr+1));
-                                    let cblk = self.next_block;
-                                    let cinstr = self.next_instr;
-                                    self.next_block = 0;
-                                    self.next_instr = 0;
-                                    Some(Step { call_id: cid,
-                                                fun: &cfun.name,
-                                                blk: cblk,
-                                                instr: cinstr,
-                                                ext: CallKind::Internal })
-                                } else {
-                                    let cinstr = self.next_instr;
-                                    self.next_instr+=1;
-                                    Some(Step { call_id: cid,
-                                                fun: &cfun.name,
-                                                blk: self.next_block,
-                                                instr: cinstr,
-                                                ext: CallKind::Internal })
-                                }
-                            },
-                            Some(fspec) => {
-                                let cinstr = self.next_instr;
-                                let rret = match rtp {
-                                    &None => None,
+                    &llvm_ir::Value::Constant(llvm_ir::Constant::Global(ref name)) => {
+                        let fun = match self.module.functions.get(name) {
+                            None => panic!("Function {} not found in module",name),
+                            Some(fun) => fun
+                        };
+                        if fun.body.is_some() && !name.starts_with("__falco_ignore") {
+                            match self.parser.next() {
+                                None => panic!("Unexpected end of trace"),
+                                Some(Element::BasicBlock(n)) => {
+                                    let (_,ref fun_name) = self.mapping[n-1];
+                                    assert_eq!(*fun_name,fun.name);
+                                },
+                                Some(el) => panic!("Unexpected element: {:#?}",el)
+                            }
+                            self.stack.push((&fun.name,self.next_block,self.next_instr+1));
+                            let cblk = self.next_block;
+                            let cinstr = self.next_instr;
+                            self.next_block = 0;
+                            self.next_instr = 0;
+                            Some(Step { id: StepId { call_id: cid,
+                                                     fun: &cfun.name,
+                                                     blk: cblk,
+                                                     instr: cinstr },
+                                        ext: CallKind::Internal })
+                        } else {
+                            let fspec = self.spec.get(name,false,rtp.is_some());
+                            let cinstr = self.next_instr;
+                            let rret = match fspec.ret() {
+                                &None => None,
+                                &Some(TraceSpec::Std) => match rtp {
+                                    &None => panic!("Function specification has return type for {}, but module doesn't",name),
                                     &Some((ref rtp_,_)) => match rtp_ {
                                         &llvm_ir::types::Type::Pointer(ref ptp,_) => match **ptp {
                                             llvm_ir::types::Type::Function(ref ret,_,_) => match ret {
                                                 &None => None,
-                                                &Some(ref rtp__) => self.parser.get_val(true,rtp__,&fspec.ret)
+                                                &Some(ref rtp__) => self.parser.get_val(true,rtp__,fspec.ret())
                                             },
-                                            _ => self.parser.get_val(true,rtp_,&fspec.ret)
+                                            _ => self.parser.get_val(true,rtp_,fspec.ret())
                                         },
-                                        _ => self.parser.get_val(true,rtp_,&fspec.ret)
+                                        _ => self.parser.get_val(true,rtp_,fspec.ret())
                                     }
-                                };
-                                let rargs = fspec.args.iter()
-                                    .zip(args.iter())
-                                    .map(|(def,tval)| {
-                                        self.parser.get_val(false,
-                                                            &tval.tp,
-                                                            def)
-                                    }).collect();
-                                self.next_instr+=1;
-                                Some(Step { call_id: cid,
-                                            fun: &cfun.name,
-                                            blk: self.next_block,
-                                            instr: cinstr,
-                                            ext: CallKind::External(External { function: name,
-                                                                               args: rargs,
-                                                                               ret: rret }) })
-                            }
-                        },
+                                },
+                                &Some(ref s) => panic!("Tracing return arguments with {:?} not supported",s)
+                            };
+                            let rargs = args.iter()
+                                .enumerate()
+                                .map(|(nr,tval)| {
+                                    let def = fspec.arg(nr);
+                                    self.parser.get_val(false,
+                                                        &tval.tp,
+                                                        def)
+                                }).collect();
+                            self.next_instr+=1;
+                            Some(Step { id: StepId { call_id: cid,
+                                                     fun: &cfun.name,
+                                                     blk: self.next_block,
+                                                     instr: cinstr },
+                                        ext: CallKind::External(External { function: name,
+                                                                           args: rargs,
+                                                                           ret: rret }) })
+                        }
+                    },
                     _ => panic!("Function pointers not supported")
                 }
             },
@@ -389,10 +384,10 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { call_id: cid,
-                                    fun: &cfun.name,
-                                    blk: cblk,
-                                    instr: cinstr,
+                        Some(Step { id: StepId { call_id: cid,
+                                                 fun: &cfun.name,
+                                                 blk: cblk,
+                                                 instr: cinstr },
                                     ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
@@ -411,10 +406,10 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { call_id: cid,
-                                    fun: &cfun.name,
-                                    blk: cblk,
-                                    instr: cinstr,
+                        Some(Step { id: StepId { call_id: cid,
+                                                 fun: &cfun.name,
+                                                 blk: cblk,
+                                                 instr: cinstr },
                                     ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
@@ -435,10 +430,10 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { call_id: cid,
-                                    fun: &cfun.name,
-                                    blk: cblk,
-                                    instr: cinstr,
+                        Some(Step { id: StepId { call_id: cid,
+                                                 fun: &cfun.name,
+                                                 blk: cblk,
+                                                 instr: cinstr },
                                     ext: CallKind::Internal })
                     },
                     Some(el) => panic!("Unexpected element: {:#?}",el)
@@ -454,10 +449,10 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             let cinstr = self.next_instr;
                             self.next_block = nxt_blk;
                             self.next_instr = nxt_instr;
-                            Some(Step { call_id: cid,
-                                        fun: &cfun.name,
-                                        blk: cblk,
-                                        instr: cinstr,
+                            Some(Step { id: StepId { call_id: cid,
+                                                     fun: &cfun.name,
+                                                     blk: cblk,
+                                                     instr: cinstr },
                                         ext: CallKind::Internal })
                         }
                     }
@@ -466,10 +461,10 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
             _ => {
                 let cinstr = self.next_instr;
                 self.next_instr+=1;
-                Some(Step { call_id: cid,
-                            fun: &cfun.name,
-                            blk: self.next_block,
-                            instr: cinstr,
+                Some(Step { id: StepId { call_id: cid,
+                                         fun: &cfun.name,
+                                         blk: self.next_block,
+                                         instr: cinstr },
                             ext: CallKind::Internal })
             }
         }
