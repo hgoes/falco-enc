@@ -483,7 +483,7 @@ fn make_selectors<B : Backend>(m: &Module,b: &mut B) -> Result<Selectors<B>,B::E
                             Entry::Vacant(vac) => {
                                 b.comment(format!("Selector for line: {}, column: {}",loc.0,loc.1).as_str())?;
                                 let tp = b.tp_bool()?;
-                                let v = b.declare_var(tp)?;
+                                let v = b.declare_var(tp,Some(format!("sel.{}.{}",loc.0,loc.1)))?;
                                 vac.insert(v);
                             }
                         }
