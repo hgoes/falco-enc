@@ -30,6 +30,7 @@ use smtrs::backend::{Backend,Pipe};
 use smtrs::domain::*;
 use smtrs::expr as expr;
 use smtrs::types as types;
+use smtrs::simplify::Simplify;
 use std::fmt::{Debug,Display};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -828,7 +829,7 @@ fn main() {
         None => fun_spec::FunSpecs::empty(),
         Some(file) => fun_spec::FunSpecs::read(file)
     };
-    let mut p = Pipe::new(io::empty(),io::stdout());
+    let mut p = Simplify::new(Pipe::new(io::empty(),io::stdout()));
     let selectors = make_selectors(&m,&mut p).unwrap();
     for (nr,tr) in args.values_of("trace").unwrap().enumerate() {
         //let (_,reader) = falco::StepReader::new(&m,&fun_spec,File::open(tr).unwrap());
