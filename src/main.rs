@@ -273,13 +273,15 @@ impl<'a,'b,V,DomProg,DomInp> DeriveValues for CompProgram<'a,'b,V,DomProg,DomInp
 
 struct FalcoCfg<Em : Embed> {
     paths: Option<Vec<Transf<Em>>>,
-    current_path: Vec<Transf<Em>>
+    current_path: Vec<Transf<Em>>,
+    extra_sel: Vec<Transf<Em>>
 }
 
 impl<Em : Embed> FalcoCfg<Em> {
     pub fn new() -> Self {
         FalcoCfg { paths: Some(Vec::new()),
-                   current_path: Vec::new() }
+                   current_path: Vec::new(),
+                   extra_sel: Vec::new() }
     }
     pub fn condition(self,em: &mut Em)
                      -> Result<Option<Transf<Em>>,Em::Error> {
@@ -341,6 +343,13 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
         }
         Ok(())
     }
+    fn change_instr_not_blocking(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        -> Result<(),Em::Error> {
+        self.extra_sel.extend(conds.drain(pos..));
+        Ok(())
+    }
 }
 
 fn step<'a,Lib,V,Dom>(m: &'a Module,
@@ -356,7 +365,8 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Option<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Dom,
-                          Dom)
+                          Dom,
+                          Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>)
     where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Semantic+Debug,
           Dom : Domain<Program<'a,V>>,
           Lib : Library<'a,V> {
@@ -444,11 +454,15 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                             }
                         }
                     }
+                    let mut extras = Vec::with_capacity(cfg.extra_sel.len());
+                    for extr in cfg.extra_sel.iter() {
+                        extras.push(extr.get(&exprs[..],0,&mut comp).unwrap())
+                    }
                     let cond = match cfg.condition(&mut comp).unwrap() {
                         None => None,
                         Some(c) => Some(c.get(&exprs[..],0,&mut comp).unwrap())
                     };
-                    return (nprog,inp.clone(),nexprs,cond,ndom1,ndom2)
+                    return (nprog,inp.clone(),nexprs,cond,ndom1,ndom2,extras)
                 },
                 Err(TrErr::InputNeeded(ninp)) => ninp,
                 _ => panic!("AAA")
@@ -528,8 +542,8 @@ struct FalcoLib<'a : 'b,'b> {
 impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b> {
     fn call<RetV,Em : DeriveValues>(&self,
                                     fname: &'a String,
-                                    _: &Vec<V>,
-                                    _: Transf<Em>,
+                                    args: &Vec<V>,
+                                    args_inp: Transf<Em>,
                                     ret_view: Option<RetV>,
                                     _: &'a DataLayout,
                                     _: InstructionRef<'a>,
@@ -544,6 +558,20 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b
         where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
         if *fname!=*self.ext.function {
             return Ok(false)
+        }
+        for (ext,(arg,arg_inp)) in self.ext.args.iter().zip(
+            vec_iter(OptRef::Ref(args),args_inp)
+        ) {
+            match ext {
+                &None => {},
+                &Some(falco::Val::Int { bw, ref val }) => {
+                    let (eval,eval_inp) = V::const_int(bw,val.clone(),em)?;
+                    let eq = comp_eq(&eval,Transformation::constant(eval_inp),
+                                     arg.as_ref(),arg_inp,em)?.unwrap();
+                    conds.push(eq);
+                },
+                _ => {}
+            }
         }
         //assert!(self.ext.args.iter().all(Option::is_none));
         match self.ext.ret {
@@ -677,7 +705,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             llvm_ir::InstructionC::GEP(_,_) => true,
             _ => false
         };
-        let (mut nprog,ninp,nprog_inp,act,mut ndom,ndom_full)
+        let (mut nprog,ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel)
             = match entr.ext {
                 falco::CallKind::Internal => {
                     let lib = StdLib {};
@@ -756,6 +784,22 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             None => {},
             Some(sel) => {
                 let sel_expr = self.backend.embed(expr::Expr::Var(sel.clone())).unwrap();
+                let sel_exprs = if extra_sel.len()==0 {
+                    sel_expr
+                } else {
+                    let mut sels = Vec::with_capacity(extra_sel.len()+1);
+                    sels.push(sel_expr);
+                    let prev = &self.program_input;
+                    for extr in extra_sel.iter() {
+                        let ne = extr.translate(&mut |n,_| if n<prog_sz {
+                            Ok(prev[n].clone())
+                        } else {
+                            Ok(cinp[n-prog_sz].clone())
+                        },self.backend).unwrap();
+                        sels.push(ne);
+                    }
+                    self.backend.and(sels).unwrap()
+                };
                 for (idx,m) in self.program_meaning.iter().enumerate() {
                     // Is this a data variable?
                     if !m.is_pc() {
@@ -768,7 +812,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                                 // Variable has changed
                                 let tp = self.program.elem_sort(idx,self.backend).unwrap();
                                 let nondet = self.backend.declare(tp).unwrap();
-                                let ne = self.backend.ite(sel_expr.clone(),nprogram_input[idx].clone(),nondet).unwrap();
+                                let ne = self.backend.ite(sel_exprs.clone(),nprogram_input[idx].clone(),nondet).unwrap();
                                 let nne = self.backend.define(ne).unwrap();
                                 nprogram_input[idx] = nne;
                                 ndom.forget_var(idx);
