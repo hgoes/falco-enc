@@ -315,6 +315,11 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             None => panic!("Function {} not found in module",name),
                             Some(fun) => fun
                         };
+                        let step_id = StepId { thread_id: tid,
+                                               call_id: cid,
+                                               fun: &cfun.name,
+                                               blk: self.next_block,
+                                               instr: self.next_instr };
                         if fun.body.is_some() && !name.starts_with("__falco_ignore") {
                             match self.parser.next() {
                                 None => panic!("Unexpected end of trace"),
@@ -325,53 +330,48 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                 Some(el) => panic!("Unexpected element: {:#?}",el)
                             }
                             self.stack.push((&fun.name,self.next_block,self.next_instr+1));
-                            let cblk = self.next_block;
-                            let cinstr = self.next_instr;
                             self.next_block = 0;
                             self.next_instr = 0;
-                            Some(Step { id: StepId { thread_id: tid,
-                                                     call_id: cid,
-                                                     fun: &cfun.name,
-                                                     blk: cblk,
-                                                     instr: cinstr },
+                            Some(Step { id: step_id,
                                         ext: CallKind::Internal })
                         } else {
                             let fspec = self.spec.get(name,false,rtp.is_some());
-                            let cinstr = self.next_instr;
-                            let rret = match fspec.ret() {
-                                &None => None,
-                                &Some(TraceSpec::Std) => match rtp {
-                                    &None => panic!("Function specification has return type for {}, but module doesn't",name),
-                                    &Some((ref rtp_,_)) => match rtp_ {
-                                        &llvm_ir::types::Type::Pointer(ref ptp,_) => match **ptp {
-                                            llvm_ir::types::Type::Function(ref ret,_,_) => match ret {
-                                                &None => None,
-                                                &Some(ref rtp__) => self.parser.get_val(true,rtp__,fspec.ret())
+                            if fspec.ignore() {
+                                self.next_instr += 1;
+                                Some(Step { id: step_id,
+                                            ext: CallKind::Internal })
+                            } else {
+                                let rret = match fspec.ret() {
+                                    &None => None,
+                                    &Some(TraceSpec::Std) => match rtp {
+                                        &None => panic!("Function specification has return type for {}, but module doesn't",name),
+                                        &Some((ref rtp_,_)) => match rtp_ {
+                                            &llvm_ir::types::Type::Pointer(ref ptp,_) => match **ptp {
+                                                llvm_ir::types::Type::Function(ref ret,_,_) => match ret {
+                                                    &None => None,
+                                                    &Some(ref rtp__) => self.parser.get_val(true,rtp__,fspec.ret())
+                                                },
+                                                _ => self.parser.get_val(true,rtp_,fspec.ret())
                                             },
                                             _ => self.parser.get_val(true,rtp_,fspec.ret())
-                                        },
-                                        _ => self.parser.get_val(true,rtp_,fspec.ret())
-                                    }
-                                },
-                                &Some(ref s) => panic!("Tracing return arguments with {:?} not supported",s)
-                            };
-                            let rargs = args.iter()
-                                .enumerate()
-                                .map(|(nr,tval)| {
-                                    let def = fspec.arg(nr);
-                                    self.parser.get_val(false,
-                                                        &tval.tp,
-                                                        def)
-                                }).collect();
-                            self.next_instr+=1;
-                            Some(Step { id: StepId { thread_id: tid,
-                                                     call_id: cid,
-                                                     fun: &cfun.name,
-                                                     blk: self.next_block,
-                                                     instr: cinstr },
-                                        ext: CallKind::External(External { function: name,
-                                                                           args: rargs,
-                                                                           ret: rret }) })
+                                        }
+                                    },
+                                    &Some(ref s) => panic!("Tracing return arguments with {:?} not supported",s)
+                                };
+                                let rargs = args.iter()
+                                    .enumerate()
+                                    .map(|(nr,tval)| {
+                                        let def = fspec.arg(nr);
+                                        self.parser.get_val(false,
+                                                            &tval.tp,
+                                                            def)
+                                    }).collect();
+                                self.next_instr+=1;
+                                Some(Step { id: step_id,
+                                            ext: CallKind::External(External { function: name,
+                                                                               args: rargs,
+                                                                               ret: rret }) })
+                            }
                         }
                     },
                     _ => panic!("Function pointers not supported")

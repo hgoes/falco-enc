@@ -263,7 +263,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                           Dom,
                           Dom,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>)
-    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Semantic+Debug,
+    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Semantic+FromMD<'a>+Debug,
           Dom : Domain<Program<'a,V>>,
           Lib : for<'b> Library<'a,V,CompProgram<'b,'a,V,Dom,()>> {
 
@@ -620,7 +620,8 @@ fn use_full_domain(instr: &llvm_ir::Instruction) -> bool {
 
 
 impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwinding<'a,R,Em,V,Dom>
-    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Debug+Semantic, Em::Expr : Display {
+    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+FromMD<'a>+Debug+Semantic,
+          Em::Expr : Display {
     pub fn new(inp: R,
                sel: &'a Selectors<Em>,
                m: &'a Module,
@@ -865,7 +866,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
 }
 
 impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
-    where V : 'a+Semantic+Bytes+FromConst<'a>+IntValue+Pointer<'a>+Vector+Debug,
+    where V : 'a+Semantic+Bytes+FromConst<'a>+IntValue+Pointer<'a>+FromMD<'a>+Vector+Debug,
           Dom : Domain<Program<'a,V>>+Clone,
           Em::Expr : Display {
     pub fn new(m: &'a Module,

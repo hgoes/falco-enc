@@ -160,6 +160,12 @@ static OPT_TRACE_SPEC_STD : Option<TraceSpec> = Some(TraceSpec::Std);
 static OPT_TRACE_SPEC_NONE : Option<TraceSpec> = None;
 
 impl<'a> OptFunSpec<'a> {
+    pub fn ignore(&self) -> bool {
+        match self {
+            &OptFunSpec::Ignore => true,
+            _ => false
+        }
+    }
     pub fn is_variadic(&self) -> bool {
         match self {
             &OptFunSpec::Spec(sp) => sp.is_variadic,
@@ -220,6 +226,8 @@ impl FunSpecs {
         match self.specs.get(name) {
             Some(r) => OptFunSpec::Spec(r),
             None => if name.starts_with("llvm.dbg.") {
+                OptFunSpec::Ignore
+            } else if name.starts_with("llvm.expect.") {
                 OptFunSpec::Ignore
             } else {
                 OptFunSpec::Default(variadic,has_ret)
