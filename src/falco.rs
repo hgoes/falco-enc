@@ -5,6 +5,7 @@ use std::str;
 use std::io::Read;
 use std::cmp::min;
 use llvm_ir;
+use symbolic_llvm::symbolic::llvm::program::ThreadId;
 use symbolic_llvm::symbolic::llvm::thread::CallId;
 use symbolic_llvm::symbolic::llvm::InstructionRef;
 use fun_spec::*;
@@ -44,6 +45,7 @@ pub enum Val {
 
 #[derive(Debug,PartialEq,Eq,Hash,Clone)]
 pub struct StepId<'a> {
+    pub thread_id: ThreadId<'a>,
     pub call_id: CallId<'a>,
     pub fun: &'a String,
     pub blk: usize,
@@ -218,7 +220,9 @@ pub struct StepReader<'a,R> {
     mapping: Vec<(String,String)>,
     stack: Vec<(&'a String,usize,usize)>,
     next_block: usize,
-    next_instr: usize
+    next_instr: usize,
+    // TODO: Replace this with a map when we figure out how to trace threads
+    thread_mapping: &'a String
 }
 
 pub struct ElementParser<R> {
@@ -246,7 +250,8 @@ impl<'a,R : Read> StepReader<'a,R> {
                            mapping: mapping,
                            stack: vec![(&fun.name,0,0)],
                            next_block: 0,
-                           next_instr: 0 })
+                           next_instr: 0,
+                           thread_mapping: &fun.name })
     }
     pub fn into_witnesses(self,nr: usize,wit: &mut Witnesses<'a>) -> () {
         for step in self {
@@ -262,6 +267,9 @@ impl<'a,R : Read> StepReader<'a,R> {
                 _ => {}
             }
         }
+    }
+    fn thread_id(&self) -> ThreadId<'a> {
+        (None,self.thread_mapping)
     }
     fn call_id(&self) -> CallId<'a> {
         match self.stack.len() {
@@ -289,6 +297,7 @@ impl<'a,R : Read> StepReader<'a,R> {
 impl<'a,R : Read> Iterator for StepReader<'a,R> {
     type Item = Step<'a>;
     fn next(&mut self) -> Option<Step<'a>> {
+        let tid = self.thread_id();
         let cid = self.call_id();
         let cfun = match self.stack.last() {
             Some(&(fname,_,_)) => self.module.functions.get(fname).expect("Function not found in module"),
@@ -320,7 +329,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             let cinstr = self.next_instr;
                             self.next_block = 0;
                             self.next_instr = 0;
-                            Some(Step { id: StepId { call_id: cid,
+                            Some(Step { id: StepId { thread_id: tid,
+                                                     call_id: cid,
                                                      fun: &cfun.name,
                                                      blk: cblk,
                                                      instr: cinstr },
@@ -354,7 +364,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                                                         def)
                                 }).collect();
                             self.next_instr+=1;
-                            Some(Step { id: StepId { call_id: cid,
+                            Some(Step { id: StepId { thread_id: tid,
+                                                     call_id: cid,
                                                      fun: &cfun.name,
                                                      blk: self.next_block,
                                                      instr: cinstr },
@@ -384,7 +395,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { id: StepId { call_id: cid,
+                        Some(Step { id: StepId { thread_id: tid,
+                                                 call_id: cid,
                                                  fun: &cfun.name,
                                                  blk: cblk,
                                                  instr: cinstr },
@@ -406,7 +418,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { id: StepId { call_id: cid,
+                        Some(Step { id: StepId { thread_id: tid,
+                                                 call_id: cid,
                                                  fun: &cfun.name,
                                                  blk: cblk,
                                                  instr: cinstr },
@@ -430,7 +443,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             Some(ref bdy) => bdy.iter().position(|blk| blk.name==*blk_name).expect("Basic block not found")
                         };
                         self.next_instr = 0;
-                        Some(Step { id: StepId { call_id: cid,
+                        Some(Step { id: StepId { thread_id: tid,
+                                                 call_id: cid,
                                                  fun: &cfun.name,
                                                  blk: cblk,
                                                  instr: cinstr },
@@ -449,7 +463,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
                             let cinstr = self.next_instr;
                             self.next_block = nxt_blk;
                             self.next_instr = nxt_instr;
-                            Some(Step { id: StepId { call_id: cid,
+                            Some(Step { id: StepId { thread_id: tid,
+                                                     call_id: cid,
                                                      fun: &cfun.name,
                                                      blk: cblk,
                                                      instr: cinstr },
@@ -461,7 +476,8 @@ impl<'a,R : Read> Iterator for StepReader<'a,R> {
             _ => {
                 let cinstr = self.next_instr;
                 self.next_instr+=1;
-                Some(Step { id: StepId { call_id: cid,
+                Some(Step { id: StepId { thread_id: tid,
+                                         call_id: cid,
                                          fun: &cfun.name,
                                          blk: self.next_block,
                                          instr: cinstr },

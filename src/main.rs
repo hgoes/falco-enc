@@ -11,9 +11,11 @@ extern crate num_bigint;
 extern crate nom;
 #[cfg(feature="cpuprofiling")]
 extern crate cpuprofiler;
+extern crate petgraph;
 
 mod fun_spec;
 mod falco;
+mod graph;
 
 use llvm_ir::{Module,Instruction,parse_module};
 use symbolic_llvm::symbolic::llvm::*;
@@ -40,130 +42,19 @@ use num_bigint::BigUint;
 use std::mem::{swap,replace};
 #[cfg(feature="cpuprofiling")]
 use cpuprofiler::PROFILER;
+use graph::{GraphBuilder,FalcoGraph,MultiCallKind,debug_graph};
+use petgraph::Direction;
+use petgraph::graph::{Graph,NodeIndex};
+use petgraph::algo::toposort;
+use std::vec::IntoIter;
 
 type Val<'a> = CompValue<ByteWidth<BasePointer<'a>>,BitVecValue>;
-
-struct SepDomain<DomA,DomB> {
-    offset1: usize,
-    dom1: DomA,
-    dom2: DomB
-}
-
-impl<A : Composite+Clone,B : Composite+Clone,DomA : Domain<A>,DomB : Domain<B>> Domain<(A,B)> for SepDomain<DomA,DomB> {
-    type ValueIterator = OptIntersection2<Value,DomA::ValueIterator,DomB::ValueIterator>;
-    fn full(obj: &(A,B)) -> Self {
-        SepDomain { offset1: obj.0.num_elem(),
-                    dom1: DomA::full(&obj.0),
-                    dom2: DomB::full(&obj.1) }
-    }
-    fn is_full(&self) -> bool {
-        self.dom1.is_full() && self.dom2.is_full()
-    }
-    fn union(&mut self,oth: &Self) -> () {
-        self.dom1.union(&oth.dom1);
-        self.dom2.union(&oth.dom2);
-    }
-    fn intersection(&mut self,oth: &Self) -> bool {
-        if !self.dom1.intersection(&oth.dom1) {
-            return false;
-        }
-        self.dom2.intersection(&oth.dom2)
-    }
-    fn derive<Em : Embed,F>(&self,_: &[Em::Expr],_: &mut Em,_: &F)
-                            -> Result<Self,Em::Error>
-        where F : Fn(&Em::Var) -> Option<usize> {
-        unimplemented!()
-    }
-    fn refine<Em : Embed,F : Fn(&Em::Var) -> Option<usize>>(&mut self,e: &Em::Expr,em: &mut Em,f: &F)
-                                                            -> Result<bool,Em::Error> {
-        let off = self.offset1;
-        let dom1_valid = self.dom1.refine(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv >= off {
-                None
-            } else {
-                Some(rv)
-            }
-        })?;
-        if !dom1_valid {
-            return Ok(false)
-        }
-        self.dom2.refine(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv < off {
-                None
-            } else {
-                Some(rv-off)
-            }
-        })
-    }
-    fn is_const<Em : Embed,F : Fn(&Em::Var) -> Option<usize>>(&self,e: &Em::Expr,em: &mut Em,f: &F)
-                                                              -> Result<Option<Value>,Em::Error> {
-        let off = self.offset1;
-        let const1 = self.dom1.is_const(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv >= off {
-                None
-            } else {
-                Some(rv)
-            }
-        })?;
-        match const1 {
-            Some(v) => return Ok(Some(v)),
-            None => {}
-        }
-        self.dom2.is_const(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv < off {
-                None
-            } else {
-                Some(rv-off)
-            }
-        })
-    }
-    fn values<Em : Embed,F : Fn(&Em::Var) -> Option<usize>>(&self,e: &Em::Expr,em: &mut Em,f: &F)
-                                                            -> Result<Option<Self::ValueIterator>,Em::Error> {
-        let off = self.offset1;
-        let vals1 = self.dom1.values(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv >= off {
-                None
-            } else {
-                Some(rv)
-            }
-        })?;
-        let vals2 = self.dom2.values(e,em,&|v| match f(v) {
-            None => None,
-            Some(rv) => if rv < off {
-                None
-            } else {
-                Some(rv-off)
-            }
-        })?;
-        match vals1 {
-            None => match vals2 {
-                None => Ok(None),
-                Some(it2) => Ok(Some(OptIntersection2::Only2(it2)))
-            },
-            Some(it1) => match vals2 {
-                None => Ok(Some(OptIntersection2::Only1(it1))),
-                Some(it2) => Ok(Some(OptIntersection2::Both(Intersection2::new(it1,it2))))
-            }
-        }
-    }
-    fn forget_var(&mut self,n: usize) -> () {
-        if n<self.offset1 {
-            self.dom1.forget_var(n)
-        } else {
-            self.dom2.forget_var(n-self.offset1)
-        }
-    }
-}
 
 struct CompProgram<'a,'b : 'a,V : 'b+Bytes+FromConst<'b>,
                    DomProg : 'a+Domain<Program<'b,V>>,
                    DomInp : 'a+Domain<ProgramInput<'b,V>>> {
     prog: &'a Program<'b,V>,
+    selectors: usize,
     inp: &'a ProgramInput<'b,V>,
     dom_prog: &'a DomProg,
     dom_inp: &'a DomInp,
@@ -199,8 +90,10 @@ impl<'a,'b,V,DomProg,DomInp> Embed for CompProgram<'a,'b,V,DomProg,DomInp>
         let prog_sz = self.prog.num_elem();
         if var.0 < prog_sz {
             self.prog.elem_sort(var.0,self)
+        } else if var.0 < prog_sz + self.selectors {
+            self.tp_bool()
         } else {
-            self.inp.elem_sort(var.0-prog_sz,self)
+            self.inp.elem_sort(var.0-prog_sz-self.selectors,self)
         }
     }
     fn type_of_fun(&mut self,_:&Self::Fun) -> Result<Self::Sort,Self::Error> {
@@ -229,8 +122,9 @@ impl<'a,'b,V,DomProg,DomInp> DeriveConst for CompProgram<'a,'b,V,DomProg,DomInp>
         if let Some(v) = const1 {
             return Ok(Some(v))
         }
-        self.dom_inp.is_const(e,self,&|v| if v.0 >= prog_sz {
-            Some(v.0-prog_sz)
+        let nsels = self.selectors;
+        self.dom_inp.is_const(e,self,&|v| if v.0 >= prog_sz+nsels {
+            Some(v.0-prog_sz-nsels)
         } else {
             None
         })
@@ -252,8 +146,9 @@ impl<'a,'b,V,DomProg,DomInp> DeriveValues for CompProgram<'a,'b,V,DomProg,DomInp
         } else {
             None
         })?;
-        let vals_inp = self.dom_inp.values(e,self,&|v| if v.0>=prog_sz {
-            Some(v.0-prog_sz)
+        let nsels = self.selectors;
+        let vals_inp = self.dom_inp.values(e,self,&|v| if v.0>=prog_sz+nsels {
+            Some(v.0-prog_sz-nsels)
         } else {
             None
         })?;
@@ -355,6 +250,7 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
 fn step<'a,Lib,V,Dom>(m: &'a Module,
                       lib: &Lib,
                       st: &Program<'a,V>,
+                      selectors: usize,
                       domain_use: &Dom,
                       domain_derive1: &Dom,
                       domain_derive2: &Dom,
@@ -369,7 +265,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>)
     where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Semantic+Debug,
           Dom : Domain<Program<'a,V>>,
-          Lib : Library<'a,V> {
+          Lib : for<'b> Library<'a,V,CompProgram<'b,'a,V,Dom,()>> {
 
     let instr = instr_id.resolve(m);
     let prog_size = st.num_elem();
@@ -379,10 +275,11 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
     let mut exprs = Vec::with_capacity(prog_size);
     {
         let mut comp = CompProgram { prog: st,
+                                     selectors: selectors,
                                      inp: &inp,
                                      dom_prog: domain_use,
                                      dom_inp: &dom_inp };
-        for i in 0..prog_size {
+        for i in 0..prog_size+selectors {
             exprs.push(comp.var(CompVar(i)).unwrap());
         }
     }
@@ -391,13 +288,14 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
 
         let ninp = {
             let mut comp = CompProgram { prog: st,
+                                         selectors: selectors,
                                          inp: &inp,
                                          dom_prog: domain_use,
                                          dom_inp: &dom_inp };
             let inp_size = inp.num_elem();
             
-            if prog_size+inp_size>exprs.len() {
-                for i in exprs.len()..prog_size+inp_size {
+            if prog_size+selectors+inp_size>exprs.len() {
+                for i in exprs.len()..prog_size+selectors+inp_size {
                     exprs.push(comp.var(CompVar(i)).unwrap());
                 }
             }
@@ -435,13 +333,13 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                                                        &|v| if v.0 < prog_size {
                                                            Some(v.0)
                                                        } else {
-                                                           panic!("Input vars?")//None
+                                                           None
                                                        }).unwrap();
                         let d2 = domain_derive2.derive(&nexprs[..],&mut comp,
                                                        &|v| if v.0 < prog_size {
                                                            Some(v.0)
                                                        } else {
-                                                           panic!("Input vars?")//None
+                                                           None
                                                        }).unwrap();
                         (d1,d2)
                     };
@@ -535,26 +433,56 @@ struct TraceUnwinding<'a,R : io::Read,Em : Embed,V : Semantic+Bytes+FromConst<'a
     debugging: u64
 }
 
+/// A translated graph node
+#[derive(Clone)]
+struct TNode<'a,V : Bytes+FromConst<'a>+Semantic,Em : Embed,Dom> {
+    prog: Program<'a,V>,
+    prog_inp: Vec<Em::Expr>,
+    domain: Dom,
+    domain_full: Dom,
+    path_cond: Vec<Em::Expr>
+}
+
+#[derive(Clone)]
+enum TStatus<'a,V : Bytes+FromConst<'a>+Semantic,Em : Embed,Dom> {
+    Untranslated,
+    Translated(Box<TNode<'a,V,Em,Dom>>),
+    Finished
+}
+
+struct GraphUnwinding<'a,Em : 'a+Embed,V : Semantic+Bytes+FromConst<'a>,Dom>
+    where Em::Var : 'a {
+    module: &'a Module,
+    backend: &'a mut Em,
+    selectors: &'a Selectors<Em>,
+    graph: FalcoGraph<'a>,
+    queue: IntoIter<NodeIndex>,
+    translation: Vec<TStatus<'a,V,Em,Dom>>,
+    trace_selector: Vec<Em::Var>,
+    trace_args: Vec<Vec<Vec<u8>>>,
+    debugging: u64
+}
+
 struct FalcoLib<'a : 'b,'b> {
     ext: &'b falco::External<'a>
 }
 
-impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b> {
-    fn call<RetV,Em : DeriveValues>(&self,
-                                    fname: &'a String,
-                                    args: &Vec<V>,
-                                    args_inp: Transf<Em>,
-                                    ret_view: Option<RetV>,
-                                    _: &'a DataLayout,
-                                    _: InstructionRef<'a>,
-                                    conds: &mut Vec<Transf<Em>>,
-                                    _: &Program<'a,V>,
-                                    prog_inp: Transf<Em>,
-                                    nprog: &mut Program<'a,V>,
-                                    updates: &mut Updates<Em>,
-                                    _: &[Em::Expr],
-                                    em: &mut Em)
-                                    -> Result<bool,Em::Error>
+impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em : DeriveValues> Library<'a,V,Em> for FalcoLib<'a,'b> {
+    fn call<RetV>(&self,
+                  fname: &'a String,
+                  args: &Vec<V>,
+                  args_inp: Transf<Em>,
+                  ret_view: Option<RetV>,
+                  _: &'a DataLayout,
+                  _: InstructionRef<'a>,
+                  conds: &mut Vec<Transf<Em>>,
+                  _: &Program<'a,V>,
+                  prog_inp: Transf<Em>,
+                  nprog: &mut Program<'a,V>,
+                  updates: &mut Updates<Em>,
+                  _: &[Em::Expr],
+                  em: &mut Em)
+                  -> Result<bool,Em::Error>
         where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
         if *fname!=*self.ext.function {
             return Ok(false)
@@ -594,6 +522,103 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue> Library<'a,V> for FalcoLib<'a,'b
     }
 }
 
+struct FalcoMultiLib<'a : 'b,'b> {
+    exts: &'b Vec<(usize,falco::External<'a>)>,
+    sel_offset: usize
+}
+
+impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em> Library<'a,V,Em> for FalcoMultiLib<'a,'b>
+    where Em : DeriveValues<Var=CompVar> {
+    fn call<RetV>(&self,
+                  fname: &'a String,
+                  args: &Vec<V>,
+                  args_inp: Transf<Em>,
+                  ret_view: Option<RetV>,
+                  _: &'a DataLayout,
+                  _: InstructionRef<'a>,
+                  conds: &mut Vec<Transf<Em>>,
+                  _: &Program<'a,V>,
+                  prog_inp: Transf<Em>,
+                  nprog: &mut Program<'a,V>,
+                  updates: &mut Updates<Em>,
+                  _: &[Em::Expr],
+                  em: &mut Em)
+                  -> Result<bool,Em::Error>
+        where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
+        let mut act_conds = Vec::new();
+        let cpos = conds.len();
+        for &(tr_nr,ref ext) in self.exts.iter() {
+            let sel_e = em.embed(expr::Expr::Var(CompVar(self.sel_offset+tr_nr)))?;
+            conds.push(Transformation::constant(vec![sel_e.clone()]));
+            if *fname!=*ext.function {
+                panic!("External function doesn't match code")
+            }
+            let mut eq_conds = vec![Transformation::constant(vec![sel_e])];
+            for (ext_arg,(arg,arg_inp)) in ext.args.iter().zip(
+                vec_iter(OptRef::Ref(args),args_inp.clone())
+            ) {
+                match ext_arg {
+                    &None => {},
+                    &Some(falco::Val::Int { bw, ref val }) => {
+                        let (eval,eval_inp) = V::const_int(bw,val.clone(),em)?;
+                        let eq = comp_eq(&eval,Transformation::constant(eval_inp),
+                                         arg.as_ref(),arg_inp,em)?.unwrap();
+                        eq_conds.push(eq);
+                    },
+                    _ => {}
+                }
+            }
+            let eq_cond = Transformation::and(eq_conds);
+            act_conds.push(eq_cond);
+            //assert!(self.ext.args.iter().all(Option::is_none));
+            match ext.ret {
+                None => {}
+                Some(ref rval) => match rval {
+                    &falco::Val::Int { bw,ref val } => {
+                        let (i,i_inp) = V::const_int(bw,val.clone(),em)?;
+                        match ret_view {
+                            None => panic!("Trace has a return value but the function doesn't..."),
+                            Some(ref ret_view_) => {
+                                ret_view_.insert_cond(nprog,i,Transformation::constant(i_inp),
+                                                      conds,updates,prog_inp.clone(),em)?
+                            }
+                        }
+                    },
+                    _ => unimplemented!()
+                }
+            }
+            conds.truncate(cpos);
+        }
+        let act_cond = Transformation::or(act_conds);
+        conds.push(act_cond);
+        Ok(true)
+    }
+}
+
+
+/// Decide if the full domain information should be used when encoding
+/// the instruction.
+fn use_full_domain(instr: &llvm_ir::Instruction) -> bool {
+    match instr.content {
+        llvm_ir::InstructionC::Call(_,_,_,ref called,_,_) => match called {
+            &llvm_ir::Value::Constant(ref c) => match c {
+                &llvm_ir::Constant::Global(ref g) => match g.as_ref() {
+                    "malloc" => true,
+                    "realloc" => true,
+                    _ => false
+                },
+                _ => false
+            },
+            _ => false
+        },
+        llvm_ir::InstructionC::Unary(_,_,llvm_ir::UnaryInst::Load(_,_)) => true,
+        llvm_ir::InstructionC::Store(_,_,_,_) => true,
+        llvm_ir::InstructionC::GEP(_,_) => true,
+        _ => false
+    }
+}
+
+
 impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwinding<'a,R,Em,V,Dom>
     where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Debug+Semantic, Em::Expr : Display {
     pub fn new(inp: R,
@@ -631,10 +656,15 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                                                              (Data((0,(ptr_bw/8) as usize)),None))),
                                               Transformation::id(0))?;
         let (argv,argv_inp) = V::from_pointer((ptr_bw/8) as usize,argv1,argv1_inp);
+        let (args0,args0_inp) = choice_empty();
+        let (args1,args1_inp) = choice_insert(OptRef::Owned(args0),args0_inp,
+                                              Transformation::const_bool(true,b)?,
+                                              OptRef::Owned(Data(args)),
+                                              Transformation::id(0))?;
         let (prog,prog_inp) = translate_init(m,fun,
                                              vec![argc,argv.as_obj()],
                                              Transformation::concat(&[Transformation::constant(argc_inp),argv_inp]),
-                                             args,
+                                             args1.as_obj(),args1_inp,
                                              b)?;
         let init_exprs = prog_inp.get_all(&[][..],b)?;
         // FIXME: This should reference (), but that is not possible in Rust
@@ -688,28 +718,12 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                instr_ref.basic_block,
                instr_ref.instruction);
         debug!(self,3,"Content: {:?}",instr);
-        let use_full = match instr.content {
-            llvm_ir::InstructionC::Call(_,_,_,ref called,_,_) => match called {
-                &llvm_ir::Value::Constant(ref c) => match c {
-                    &llvm_ir::Constant::Global(ref g) => match g.as_ref() {
-                        "malloc" => true,
-                        "realloc" => true,
-                        _ => false
-                    },
-                    _ => false
-                },
-                _ => false
-            },
-            llvm_ir::InstructionC::Unary(_,_,llvm_ir::UnaryInst::Load(_,_)) => true,
-            llvm_ir::InstructionC::Store(_,_,_,_) => true,
-            llvm_ir::InstructionC::GEP(_,_) => true,
-            _ => false
-        };
+        let use_full = use_full_domain(instr);
         let (mut nprog,ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel)
             = match entr.ext {
                 falco::CallKind::Internal => {
                     let lib = StdLib {};
-                    step(self.module,&lib,&self.program,
+                    step(self.module,&lib,&self.program,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -721,7 +735,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                 },
                 falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
-                    step(self.module,&lib,&self.program,
+                    step(self.module,&lib,&self.program,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -732,7 +746,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          thr_id,entr.id.call_id,instr_ref)
                 } else {
                     let lib = FalcoLib { ext: ext };
-                    step(self.module,&lib,&self.program,
+                    step(self.module,&lib,&self.program,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -850,6 +864,476 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
     }
 }
 
+impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
+    where V : 'a+Semantic+Bytes+FromConst<'a>+IntValue+Pointer<'a>+Vector+Debug,
+          Dom : Domain<Program<'a,V>>+Clone,
+          Em::Expr : Display {
+    pub fn new(m: &'a Module,
+               b: &'a mut Em,
+               selectors: &'a Selectors<Em>,
+               gr: FalcoGraph<'a>,
+               args: Vec<Vec<Vec<u8>>>,
+               debugging: u64) -> Result<Self,Em::Error> {
+        let qs = match toposort(&gr,None) {
+            Ok(r) => r,
+            Err(_) => panic!("Unwinding graph contains cycles")
+        };
+        let sz = gr.node_count();
+        let mut sels = Vec::with_capacity(args.len());
+        let tp_bool = b.tp_bool()?;
+        for n in 0..args.len() {
+            let sel = b.declare_var(tp_bool.clone(),Some(format!("tr{}",n)))?;
+            sels.push(sel);
+        }
+        let mut transl = Vec::with_capacity(sz);
+        for _ in 0..sz {
+            transl.push(TStatus::Untranslated)
+        }
+        Ok(GraphUnwinding {
+            module: m,
+            backend: b,
+            selectors: selectors,
+            graph: gr,
+            queue: qs.into_iter(),
+            translation: transl,
+            trace_selector: sels,
+            trace_args: args,
+            debugging: debugging
+        })
+    }
+    pub fn step(&mut self) -> Result<bool,Em::Error> {
+        let nxt_nd_id = match self.queue.next() {
+            None => return Ok(false),
+            Some(n) => n
+        };
+        let nxt_nd = self.graph.node_weight(nxt_nd_id).unwrap();
+        let starts = nxt_nd.start.len();
+        let (prog,prog_inp,dom,dom_full,mut path_cond) = if starts>0 {
+            let fun = nxt_nd.id.fun;
+            let argc_bw = match self.module.functions.get(fun) {
+                None => panic!("Function {} not found in module",fun),
+                Some(rfun) => if rfun.arguments.len()==2 {
+                    let argc_tp = &rfun.arguments[0].1;
+                    match argc_tp {
+                        &llvm_ir::types::Type::Int(w) => w,
+                        _ => panic!("First parameter of {} function should be an int, but is {:?}",
+                                    fun,argc_tp)
+                    }
+                } else {
+                    panic!("Function {} should have two arguments, found {}.",
+                           fun,rfun.arguments.len())
+                }
+            };
+            let mut argc = None;
+            let (aux0,aux_inp0) = choice_empty();
+            let mut aux = OptRef::Owned(aux0);
+            let mut aux_inp = aux_inp0;
+            let (ptr_bw,_,_) = self.module.datalayout.pointer_alignment(0);
+            let (argv0,argv0_inp) = choice_empty();
+            let (argv1,argv1_inp) = choice_insert(OptRef::Owned(argv0),argv0_inp,
+                                                  Transformation::const_bool(true,self.backend)?,
+                                                  OptRef::Owned((PointerTrg::AuxArray,
+                                                                 (Data((0,(ptr_bw/8) as usize)),None))),
+                                                  Transformation::id(0))?;
+            let (argv,argv_inp) = V::from_pointer((ptr_bw/8) as usize,argv1,argv1_inp);
+            let mut inp = Vec::with_capacity(starts);
+            for (n,start) in nxt_nd.start.iter().enumerate() {
+                let arg = &self.trace_args[*start];
+                let nargc = {
+                    let (cargc,cargc_inp) = V::const_int(argc_bw,BigUint::from(arg.len()),self.backend)?;
+                    match argc {
+                        None => (OptRef::Owned(cargc),Transformation::constant(cargc_inp)),
+                        Some((oargc,oargc_inp)) => ite(OptRef::Owned(cargc),oargc,
+                                                       Transformation::view(n,1,Transformation::id(starts)),
+                                                       Transformation::constant(cargc_inp),
+                                                       oargc_inp,self.backend)?.unwrap()
+                    }
+                };
+                let (naux,naux_inp) = choice_insert(aux,aux_inp,
+                                                    Transformation::view(n,1,Transformation::id(starts)),
+                                                    OptRef::Owned(Data(arg.clone())),Transformation::id(0))?;
+                aux = naux;
+                aux_inp = naux_inp;
+                argc = Some(nargc);
+                let sel_var = self.trace_selector[*start].clone();
+                inp.push(self.backend.embed(expr::Expr::Var(sel_var))?);
+            }
+            let (argc_,argc_inp) = argc.unwrap();
+            let (prog,prog_inp) = translate_init(self.module,fun,
+                                                 vec![argc_.as_obj(),argv.as_obj()],
+                                                 Transformation::concat(&[argc_inp,argv_inp]),
+                                                 aux.as_obj(),aux_inp,
+                                                 self.backend)?;
+            let init_exprs = prog_inp.get_all(&inp[..],self.backend)?;
+            let dom_none : Dom = Dom::full(prog.as_ref());
+            let dom_init = <Dom as Domain<Program<V>>>::derive(
+                &dom_none,&init_exprs,self.backend,
+                &|_| { None }
+            )?;
+            let mut path_sels = Vec::with_capacity(starts);
+            for start in nxt_nd.start.iter() {
+                path_sels.push(self.backend.embed(expr::Expr::Var(self.trace_selector[*start].clone()))?);
+            }
+            let path_cond = vec![self.backend.or(path_sels)?];
+            (prog.as_obj(),init_exprs,dom_init.clone(),dom_init,path_cond)
+        } else {
+            let mut incoming = self.graph.neighbors_directed(nxt_nd_id,
+                                                             Direction::Incoming);
+            // If it is not a starting node, it must have at least one
+            // predecessor:
+            let first_id = incoming.next().unwrap();
+            let first : &TNode<_,_,_> = match self.translation[first_id.index()] {
+                TStatus::Translated(ref nd) => &**nd,
+                TStatus::Untranslated => panic!("Incoming node is untranslated"),
+                TStatus::Finished => panic!("Incoming node is finished")
+            };
+            let mut prog = OptRef::Ref(&first.prog);
+            let mut prog_inp = OptRef::Ref(&first.prog_inp);
+            let mut dom = OptRef::Ref(&first.domain);
+            let mut dom_full = OptRef::Ref(&first.domain_full);
+            let mut path_cond = first.path_cond.clone();
+            let mut one_inc = true;
+            for inc_id in incoming {
+                if one_inc {
+                    one_inc = false;
+                    let ncond = self.backend.and(path_cond)?;
+                    path_cond = vec![ncond];
+                }
+                let inc : &TNode<_,_,_> = match self.translation[inc_id.index()] {
+                    TStatus::Translated(ref nd) => &**nd,
+                    TStatus::Untranslated => panic!("Incoming node is untranslated"),
+                    TStatus::Finished => panic!("Incoming node is finished")
+                };
+                let (nprog,nprog_inp,ndom,ndom_full,cond) = merge_edge(prog,prog_inp,dom,dom_full,inc,self.backend)?;
+                prog = nprog;
+                prog_inp = nprog_inp;
+                dom = ndom;
+                dom_full = ndom_full;
+                path_cond.push(cond);
+            }
+            let rpath_cond = if one_inc {
+                path_cond
+            } else {
+                let ncond = self.backend.or(path_cond)?;
+                let ncond_def = self.backend.define(ncond)?;
+                vec![ncond_def]
+            };
+            (prog.as_obj(),prog_inp.as_obj(),dom.as_obj(),dom_full.as_obj(),rpath_cond)
+        };
+        let fun = self.module.functions.get(nxt_nd.id.fun)
+            .expect("Function not found");
+        let (instr,instr_ref) = match fun.body {
+            None => panic!("Function has no body"),
+            Some(ref blks) => {
+                let blk = &blks[nxt_nd.id.blk];
+                (&blk.instrs[nxt_nd.id.instr],
+                 InstructionRef { function: &fun.name,
+                                  basic_block: &blk.name,
+                                  instruction: nxt_nd.id.instr })
+            }
+        };
+        debug!(self,1,"Instruction {}.{}.{}",
+               instr_ref.function,
+               instr_ref.basic_block,
+               instr_ref.instruction);
+        debug!(self,3,"Content: {:?}",instr);
+        let use_full = use_full_domain(instr);
+        let (nprog,ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel) = match nxt_nd.ext {
+            MultiCallKind::Internal => {
+                let lib = StdLib {};
+                step(self.module,&lib,&prog,self.trace_selector.len(),
+                     if use_full {
+                         &dom_full
+                     } else {
+                         &dom
+                     },
+                     &dom,
+                     &dom_full,
+                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref)
+            },
+            MultiCallKind::External(ref exts) => {
+                let lib = FalcoMultiLib {
+                    exts: exts,
+                    sel_offset: prog_inp.len()
+                };
+                step(self.module,&lib,&prog,self.trace_selector.len(),
+                     if use_full {
+                         &dom_full
+                     } else {
+                         &dom
+                     },
+                     &dom,
+                     &dom_full,
+                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref)
+            }
+        };
+        let num_inp = ninp.num_elem();
+
+        let mut cinp = Vec::with_capacity(num_inp);
+        for i in 0..num_inp {
+            let tp = ninp.elem_sort(i,self.backend).unwrap();
+            let var = self.backend.declare(tp).unwrap();
+            cinp.push(var);
+        }
+        let prog_sz = prog.num_elem();
+        let nprog_sz = nprog.num_elem();
+        // Number of traces
+        let nr_trs = self.trace_selector.len();
+        let tr_sels = &self.trace_selector;
+        let mut nprogram_input = Vec::with_capacity(nprog_inp.len());
+        for e in nprog_inp.iter() {
+            let ne = e.translate(&mut |n,em:&mut Em| if n<prog_sz {
+                Ok(prog_inp[n].clone())
+            } else if n<prog_sz+nr_trs {
+                em.embed(expr::Expr::Var(tr_sels[n-prog_sz].clone()))
+            } else {
+                Ok(cinp[n-prog_sz-nr_trs].clone())
+            },self.backend).unwrap();
+            nprogram_input.push(ne);
+        }
+        if let Some(l) = get_dbg_loc(instr,self.module) {
+            let sel = self.selectors.get(&l).expect("Selector not found");
+            let sel_expr = self.backend.embed(expr::Expr::Var(sel.clone())).unwrap();
+            let sel_exprs = if extra_sel.len()==0 {
+                sel_expr
+            } else {
+                let mut sels = Vec::with_capacity(extra_sel.len()+1);
+                sels.push(sel_expr);
+                for extr in extra_sel.iter() {
+                    let ne = extr.translate(&mut |n,em:&mut Em| if n<prog_sz {
+                        Ok(prog_inp[n].clone())
+                    } else if n<prog_sz+nr_trs {
+                        em.embed(expr::Expr::Var(tr_sels[n-prog_sz].clone()))
+                    } else {
+                        Ok(cinp[n-prog_sz-nr_trs].clone())
+                    },self.backend).unwrap();
+                    sels.push(ne);
+                }
+                self.backend.and(sels).unwrap()
+            };
+            let old_semantics = {
+                let mut sem = Vec::with_capacity(prog_sz);
+                match prog.first_meaning() {
+                    None => {},
+                    Some((mut ctx,mut m)) => {
+                        sem.push(m.clone());
+                        while prog.next_meaning(&mut ctx,&mut m) {
+                            sem.push(m.clone());
+                        }
+                    }
+                }
+                sem
+            };
+            let new_semantics = {
+                let mut sem = Vec::with_capacity(nprog_sz);
+                match nprog.first_meaning() {
+                    None => {},
+                    Some((mut ctx,mut m)) => {
+                        sem.push(m.clone());
+                        while nprog.next_meaning(&mut ctx,&mut m) {
+                            sem.push(m.clone());
+                        }
+                    }
+                }
+                sem
+            };
+            for (idx,m) in new_semantics.iter().enumerate() {
+                // Is this a data variable?
+                if !m.is_pc() {
+                    // Has the data variable changed?
+                    match *nprog_inp[idx].0 {
+                        expr::Expr::Var(ref old_idx)
+                            if old_semantics[old_idx.0]==*m => {},
+                        _ => {
+                            debug!(self,2,"Meaning: {}",MeaningOf::new(&nprog,m));
+                            // Variable has changed
+                            let tp = nprog.elem_sort(idx,self.backend).unwrap();
+                            let nondet = self.backend.declare(tp).unwrap();
+                            let ne = self.backend.ite(sel_exprs.clone(),nprogram_input[idx].clone(),nondet).unwrap();
+                            let nne = self.backend.define(ne).unwrap();
+                            nprogram_input[idx] = nne;
+                            ndom.forget_var(idx);
+                        }
+                    }
+                } else if self.debugging>=2 {
+                    match *nprog_inp[idx].0 {
+                        expr::Expr::Var(ref old_idx)
+                            if old_semantics[old_idx.0]==*m => {},
+                        _ => {
+                            debug!(self,2,"New PC: {} = {}",MeaningOf::new(&nprog,m),nprogram_input[idx]);
+                        }
+                    }
+                }
+            }
+        }
+        match act {
+            None => {},
+            Some(act_) => {
+                let nact = act_.translate(&mut |n,em:&mut Em| if n<prog_sz {
+                    Ok(prog_inp[n].clone())
+                } else if n<prog_sz+nr_trs {
+                    em.embed(expr::Expr::Var(tr_sels[n-prog_sz].clone()))
+                } else {
+                    Ok(cinp[n-prog_sz-nr_trs].clone())
+                },self.backend).unwrap();
+                debug!(self,2,"Activation: {}",nact);
+                path_cond.push(nact);
+            }
+        }
+        if nxt_nd.end.len() > 0 {
+            let path = self.backend.and(path_cond.clone())?;
+            let cond = self.backend.not(path)?;
+            self.backend.assert(cond)?;
+        }
+        self.translation[nxt_nd_id.index()] = TStatus::Translated(
+            Box::new(TNode { prog: nprog,
+                             prog_inp: nprogram_input,
+                             domain: ndom,
+                             domain_full: ndom_full,
+                             path_cond: path_cond }));
+        Ok(true)
+    }
+    pub fn declare_traces(&mut self) -> Result<(),Em::Error> {
+        for i in 0..self.trace_selector.len() {
+            self.backend.comment(&format!("Trace {}",i))?;
+            for (j,v) in self.trace_selector.iter().enumerate() {
+                let e = self.backend.embed(expr::Expr::Var(v.clone()))?;
+                let ne = if i==j { e } else { self.backend.not(e)? };
+                self.backend.assert(ne)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn merge_edge<'a,'b,V,Em,Dom>(
+    prog: OptRef<'b,Program<'a,V>>,
+    prog_inp: OptRef<'b,Vec<Em::Expr>>,
+    dom: OptRef<'b,Dom>,
+    dom_full: OptRef<'b,Dom>,
+    inc: &TNode<'a,V,Em,Dom>,
+    em: &mut Em
+) -> Result<(OptRef<'b,Program<'a,V>>,
+             OptRef<'b,Vec<Em::Expr>>,
+             OptRef<'b,Dom>,
+             OptRef<'b,Dom>,
+             Em::Expr),Em::Error>
+    where
+    V: Bytes+FromConst<'a>+Semantic+Debug,
+    Dom: Domain<Program<'a,V>>,
+    Em: Embed
+{
+    let cur_sz = prog_inp.as_ref().len();
+    let inc_sz = inc.prog_inp.len();
+    let mut comp = Comp { referenced: (&BOOL_SINGLETON,
+                                       &inc.prog,
+                                       prog.as_ref()) };
+    let base = Transformation::id(cur_sz+inc_sz+1);
+    let (nprog,ninp) = ite(OptRef::Ref(&inc.prog),
+                           prog.to_ref(),
+                           Transformation::view(0,1,base.clone()),
+                           Transformation::view(1,inc_sz,
+                                                base.clone()),
+                           Transformation::view(1+inc_sz,cur_sz,
+                                                base.clone()),&mut comp).unwrap().unwrap();
+    let mut work = Vec::with_capacity(cur_sz+inc_sz+1);
+    for i in 0..cur_sz+inc_sz+1 {
+        work.push(comp.embed(expr::Expr::Var(CompVar(i))).unwrap());
+    }
+    let res = ninp.get_all(&work[..],&mut comp).unwrap();
+    let ndom = Dom::derives(&res[..],&mut comp,&|&CompVar(n)| {
+        if n==0 {
+            return None
+        }
+        if n<inc_sz+1 {
+            return Some((&inc.domain,n-1))
+        }
+        Some((dom.as_ref(),n-1-inc_sz))
+    }).unwrap();
+    let ndom_full = Dom::derives(&res[..],&mut comp,&|&CompVar(n)| {
+        if n==0 {
+            return None
+        }
+        if n<inc_sz+1 {
+            return Some((&inc.domain_full,n-1))
+        }
+        Some((dom_full.as_ref(),n-1-inc_sz))
+    }).unwrap();
+    let mut nprog_inp = Vec::with_capacity(res.len());
+    let cond = match inc.path_cond.len() {
+        0 => em.const_bool(true),
+        1 => Ok(inc.path_cond[0].clone()),
+        _ => em.and(inc.path_cond.clone())
+    }?;
+    for e in res.iter() {
+        let ne = e.translate(&mut |i,em| {
+            if i==0 {
+                Ok(cond.clone())
+            } else if i<inc_sz+1 {
+                Ok(inc.prog_inp[i-1].clone())
+            } else {
+                Ok(prog_inp.as_ref()[i-1-inc_sz].clone())
+            }
+        },em)?;
+        nprog_inp.push(ne);
+    }
+    Ok((nprog.to_owned(),OptRef::Owned(nprog_inp),
+        OptRef::Owned(ndom),OptRef::Owned(ndom_full),
+        cond))
+}
+
+fn update_on_semantic_change<'a,C,D,It,Dom,Em,F>(new: &C,
+                                                 old_semantics: &[C::Meaning],
+                                                 new_semantics: &mut Semantics<'a,D>,
+                                                 input_abstract: &[CompExpr<C>],
+                                                 input_concrete: &mut Vec<Em::Expr>,
+                                                 selector: &Em::Expr,
+                                                 domain: &mut Dom,
+                                                 em: &mut Em,
+                                                 debugging: bool,
+                                                 update: F)
+                                                 -> Result<(),Em::Error> 
+    where
+    C: Semantic+Composite,
+    D: Semantic<Meaning=C::Meaning>,
+    Dom: Domain<C>,
+    F: Fn(&C::Meaning) -> bool,
+    Em: Backend,
+    Em::Expr: Display {
+
+    let mut idx = 0;
+    while let Some(m) = new_semantics.next_ref() {
+        // Should this variable be updated?
+        if update(m) {
+            // Has the variable changed?
+            match *input_abstract[idx].0 {
+                expr::Expr::Var(ref old_idx)
+                    if old_semantics[old_idx.0]==*m => {},
+                _ => {
+                    // Variable has changed
+                    if debugging {
+                        em.comment(&format!("Meaning: {}",MeaningOf::new(new,m)))?
+                    }
+                    let tp = new.elem_sort(idx,em)?;
+                    let nondet = em.declare(tp)?;
+                    let ne = em.ite(selector.clone(),input_concrete[idx].clone(),nondet)?;
+                    let nne = em.define(ne)?;
+                    input_concrete[idx] = nne;
+                    domain.forget_var(idx);
+                }
+            }
+        } else if debugging {
+            match *input_abstract[idx].0 {
+                expr::Expr::Var(ref old_idx)
+                    if old_semantics[old_idx.0]==*m => {},
+                _ => em.comment(&format!("New PC: {} = {}",MeaningOf::new(new,m),input_concrete[idx]))?
+            }
+        }
+        idx+=1;
+    }
+    Ok(())
+}
+
 fn main() {
     #[cfg(feature="cpuprofiling")]
     PROFILER.lock().unwrap().start("./falco-enc.profile").unwrap();
@@ -857,6 +1341,7 @@ fn main() {
                          (version: "0.1")
                          (author: "Henning Günther <guenther@forsyte.at>")
                          (about: "Encodes a falco trace into an SMT instance")
+                         (@arg bmc: -b --bmc "Encode all traces into one BMC instance")
                          (@arg fun_spec: -f --fun_spec <FILE> !required +takes_value "Use a tracing specification file")
                          (@arg debug: -d --debug !required +multiple "Add extra debugging information to the trace")
                          (@arg llvm_file: +required "The LLVM file")
@@ -875,20 +1360,38 @@ fn main() {
     };
     let mut p = Simplify::new(Pipe::new(io::empty(),io::stdout()));
     let selectors = make_selectors(&m,&mut p).unwrap();
-    for (nr,tr) in args.values_of("trace").unwrap().enumerate() {
-        //let (_,reader) = falco::StepReader::new(&m,&fun_spec,File::open(tr).unwrap());
-        //println!("Steps: {}",reader.count());
-        p.comment(format!("Trace {}",nr).as_ref()).unwrap();
-        let path = {
-            let mut unw : TraceUnwinding<_,_,Val,AttributeDomain<Const>>
-                = TraceUnwinding::new(File::open(tr).unwrap(),&selectors,&m,&fun_spec,&mut p,debugging).unwrap();
-            while unw.step() {
-            }
-            unw.path
-        };
-        let path_cond = p.and(path).unwrap();
-        let neg_path_cond = p.not(path_cond).unwrap();
-        p.assert(neg_path_cond).unwrap();
+
+    if args.is_present("bmc") {
+        let mut builder = GraphBuilder::new();
+        let mut all_args = Vec::with_capacity(args.occurrences_of("trace") as usize);
+        for (nr,tr) in args.values_of("trace").unwrap().enumerate() {
+            let (args,mut reader) = falco::StepReader::new(
+                &m,&fun_spec,
+                File::open(tr).unwrap());
+            builder.add_trace(nr,&mut reader);
+            all_args.push(args);
+        }
+        let gr = builder.finish();
+        let mut unw : GraphUnwinding<_,Val,AttributeDomain<Const>>
+            = GraphUnwinding::new(&m,&mut p,&selectors,gr,all_args,debugging).unwrap();
+        while unw.step().unwrap() {}
+        unw.declare_traces().unwrap();
+    } else {
+        for (nr,tr) in args.values_of("trace").unwrap().enumerate() {
+            //let (_,reader) = falco::StepReader::new(&m,&fun_spec,File::open(tr).unwrap());
+            //println!("Steps: {}",reader.count());
+            p.comment(format!("Trace {}",nr).as_ref()).unwrap();
+            let path = {
+                let mut unw : TraceUnwinding<_,_,Val,AttributeDomain<Const>>
+                    = TraceUnwinding::new(File::open(tr).unwrap(),&selectors,&m,&fun_spec,&mut p,debugging).unwrap();
+                while unw.step() {
+                }
+                unw.path
+            };
+            let path_cond = p.and(path).unwrap();
+            let neg_path_cond = p.not(path_cond).unwrap();
+            p.assert(neg_path_cond).unwrap();
+        }
     }
     #[cfg(feature="cpuprofiling")]
     PROFILER.lock().unwrap().stop().unwrap();
