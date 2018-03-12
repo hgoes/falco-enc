@@ -20,13 +20,18 @@ mod graph;
 use llvm_ir::{Module,Instruction,parse_module};
 use symbolic_llvm::symbolic::llvm::*;
 use symbolic_llvm::symbolic::llvm::program::*;
-use symbolic_llvm::symbolic::llvm::pointer::*;
+use symbolic_llvm::symbolic::llvm::pointer::{Pointer,PointerTrg,BasePointer};
 use symbolic_llvm::symbolic::llvm::mem::*;
 use symbolic_llvm::symbolic::llvm::thread::CallId;
 use symbolic_llvm::symbolic::llvm::library::{Library,StdLib};
 use llvm_ir::datalayout::DataLayout;
 use smtrs::types::Value;
 use smtrs::composite::*;
+use smtrs::composite::expr::*;
+use smtrs::composite::vec::*;
+use smtrs::composite::map::*;
+use smtrs::composite::choice::*;
+use smtrs::composite::singleton::*;
 use smtrs::embed::{Embed,DeriveConst,DeriveValues};
 use smtrs::backend::{Backend,Pipe};
 use smtrs::domain::*;
@@ -50,9 +55,9 @@ use std::vec::IntoIter;
 
 type Val<'a> = CompValue<ByteWidth<BasePointer<'a>>,BitVecValue>;
 
-struct CompProgram<'a,'b : 'a,V : 'b+Bytes+FromConst<'b>,
-                   DomProg : 'a+Domain<Program<'b,V>>,
-                   DomInp : 'a+Domain<ProgramInput<'b,V>>> {
+struct CompProgram<'a,'b: 'a,V: 'b+Bytes<'b>+FromConst<'b>,
+                   DomProg: 'a+Domain<Program<'b,V>>,
+                   DomInp: 'a+Domain<ProgramInput<'b,V>>> {
     prog: &'a Program<'b,V>,
     selectors: usize,
     inp: &'a ProgramInput<'b,V>,
@@ -60,10 +65,20 @@ struct CompProgram<'a,'b : 'a,V : 'b+Bytes+FromConst<'b>,
     dom_inp: &'a DomInp,
 }
 
+impl<'a,'b,V,DomProg,DomInp> CompProgram<'a,'b,V,DomProg,DomInp>
+where V: Bytes<'b>+FromConst<'b>+Debug,
+      DomProg: 'a+Domain<Program<'b,V>>,
+      DomInp: 'a+Domain<ProgramInput<'b,V>> {
+    pub fn selector(&mut self,nr: usize) -> Result<CompExpr<(Program<'b,V>,ProgramInput<'b,V>)>,()> {
+        let prog_sz = self.prog.num_elem();
+        self.var(CompVar(prog_sz+nr))
+    }
+}
+
 impl<'a,'b,V,DomProg,DomInp> Embed for CompProgram<'a,'b,V,DomProg,DomInp>
-    where V : Bytes+FromConst<'b>+Debug,
-          DomProg : 'a+Domain<Program<'b,V>>,
-          DomInp : 'a+Domain<ProgramInput<'b,V>> {
+    where V: Bytes<'b>+FromConst<'b>+Debug,
+          DomProg: 'a+Domain<Program<'b,V>>,
+          DomInp: 'a+Domain<ProgramInput<'b,V>> {
     
     type Sort = types::Sort;
     type Var = CompVar;
@@ -108,9 +123,9 @@ impl<'a,'b,V,DomProg,DomInp> Embed for CompProgram<'a,'b,V,DomProg,DomInp>
 }
 
 impl<'a,'b,V,DomProg,DomInp> DeriveConst for CompProgram<'a,'b,V,DomProg,DomInp>
-    where V : Bytes+FromConst<'b>+Debug,
-          DomProg : 'a+Domain<Program<'b,V>>,
-          DomInp : 'a+Domain<ProgramInput<'b,V>> {
+    where V: Bytes<'b>+FromConst<'b>+Debug,
+          DomProg: 'a+Domain<Program<'b,V>>,
+          DomInp: 'a+Domain<ProgramInput<'b,V>> {
     fn derive_const(&mut self,e: &Self::Expr)
                     -> Result<Option<Value>,Self::Error> {
         let prog_sz = self.prog.num_elem();
@@ -132,9 +147,9 @@ impl<'a,'b,V,DomProg,DomInp> DeriveConst for CompProgram<'a,'b,V,DomProg,DomInp>
 }
 
 impl<'a,'b,V,DomProg,DomInp> DeriveValues for CompProgram<'a,'b,V,DomProg,DomInp>
-    where V : Bytes+FromConst<'b>+Debug,
-          DomProg : 'a+Domain<Program<'b,V>>,
-          DomInp : 'a+Domain<ProgramInput<'b,V>> {
+    where V: Bytes<'b>+FromConst<'b>+Debug,
+          DomProg: 'a+Domain<Program<'b,V>>,
+          DomInp: 'a+Domain<ProgramInput<'b,V>> {
     type ValueIterator = OptIntersection2<Value,DomProg::ValueIterator,DomInp::ValueIterator>;
     fn derive_values(
         &mut self, 
@@ -166,56 +181,57 @@ impl<'a,'b,V,DomProg,DomInp> DeriveValues for CompProgram<'a,'b,V,DomProg,DomInp
     }
 }
 
-struct FalcoCfg<Em : Embed> {
-    paths: Option<Vec<Transf<Em>>>,
-    current_path: Vec<Transf<Em>>,
-    extra_sel: Vec<Transf<Em>>
+struct FalcoCfg<Em: Embed> {
+    paths: Option<Vec<Em::Expr>>,
+    current_path: Vec<Em::Expr>,
+    extra_sel: Vec<Em::Expr>
 }
 
-impl<Em : Embed> FalcoCfg<Em> {
+impl<Em: Embed> FalcoCfg<Em> {
     pub fn new() -> Self {
         FalcoCfg { paths: Some(Vec::new()),
                    current_path: Vec::new(),
                    extra_sel: Vec::new() }
     }
     pub fn condition(self,em: &mut Em)
-                     -> Result<Option<Transf<Em>>,Em::Error> {
-        match self.paths {
-            None => Ok(None),
+                     -> Result<(Option<Em::Expr>,Vec<Em::Expr>),Em::Error> {
+        let cond = match self.paths {
+            None => None,
             Some(mut paths) => match paths.len() {
-                0 => Ok(Some(Transformation::const_bool(false,em)?)),
-                1 => Ok(Some(paths.remove(0))),
-                _ => Ok(Some(Transformation::or(paths)))
+                0 => Some(em.const_bool(false)?),
+                1 => Some(paths.remove(0)),
+                _ => Some(em.or(paths)?)
             }
-        }
+        };
+        Ok((cond,self.extra_sel))
     }
 }
 
-impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
+impl<Em: Embed> TranslationCfg<Em> for FalcoCfg<Em> {
     fn change_thread_activation(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        conds:&mut Vec<Em::Expr>,pos:usize,_:&mut Em)
         -> Result<(),Em::Error> {
         self.current_path.extend(conds.drain(pos..));
         Ok(())
     }
     fn change_context_activation(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        conds:&mut Vec<Em::Expr>,pos:usize,_:&mut Em)
         -> Result<(),Em::Error> {
         self.current_path.extend(conds.drain(pos..));
         Ok(())
     }
     fn change_call_frame_activation(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        conds:&mut Vec<Em::Expr>,pos:usize,_:&mut Em)
         -> Result<(),Em::Error> {
         self.current_path.extend(conds.drain(pos..));
         Ok(())
     }
     fn change_instr_activation(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        conds:&mut Vec<Em::Expr>,pos:usize,em:&mut Em)
         -> Result<(),Em::Error> {
         self.current_path.extend(conds.drain(pos..));
         let mut path = replace(&mut self.current_path,Vec::new());
@@ -232,7 +248,7 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
             _ => match self.paths {
                 None => {},
                 Some(ref mut paths) => {
-                    paths.push(Transformation::and(path))
+                    paths.push(em.and(path)?)
                 }
             }
         }
@@ -240,7 +256,7 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
     }
     fn change_instr_not_blocking(
         &mut self,
-        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        conds:&mut Vec<Em::Expr>,pos:usize,_:&mut Em)
         -> Result<(),Em::Error> {
         self.extra_sel.extend(conds.drain(pos..));
         Ok(())
@@ -249,7 +265,7 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
 
 fn step<'a,Lib,V,Dom>(m: &'a Module,
                       lib: &Lib,
-                      st: &Program<'a,V>,
+                      st: &mut Program<'a,V>,
                       selectors: usize,
                       domain_use: &Dom,
                       domain_derive1: &Dom,
@@ -257,22 +273,24 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                       thread_id: ThreadId<'a>,
                       cf_id: CallId<'a>,
                       instr_id: InstructionRef<'a>)
-                      -> (Program<'a,V>,ProgramInput<'a,V>,
+                      -> (ProgramInput<'a,V>,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Option<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Dom,
                           Dom,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>)
-    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+Semantic+FromMD<'a>+Debug,
-          Dom : Domain<Program<'a,V>>,
-          Lib : for<'b> Library<'a,V,CompProgram<'b,'a,V,Dom,()>> {
+    where V: 'a+Bytes<'a>+FromConst<'a>+Pointer<'a>+IntValue<'a>+Vector<'a>+Semantic+FromMD<'a>+Debug,
+          Dom: Domain<Program<'a,V>>,
+          Lib: for<'b> Library<'a,V,CompProgram<'b,'a,V,Dom,()>> {
 
     let instr = instr_id.resolve(m);
     let prog_size = st.num_elem();
 
-    let mut inp = ProgramInput::new();
+    let mut inp = ProgramInput::new_sig();
+    let inp_size = inp.num_elem();
     let dom_inp = ();
     let mut exprs = Vec::with_capacity(prog_size);
+    let mut exprs_inp = Vec::with_capacity(inp.num_elem());
     {
         let mut comp = CompProgram { prog: st,
                                      selectors: selectors,
@@ -282,25 +300,27 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
         for i in 0..prog_size+selectors {
             exprs.push(comp.var(CompVar(i)).unwrap());
         }
+        for i in prog_size+selectors..prog_size+selectors+inp_size {
+            exprs_inp.push(comp.var(CompVar(i)).unwrap());
+        }
     }
-
+    let old_prog = st.clone();
     loop {
 
         let ninp = {
-            let mut comp = CompProgram { prog: st,
+            let mut comp = CompProgram { prog: &old_prog,
                                          selectors: selectors,
                                          inp: &inp,
                                          dom_prog: domain_use,
                                          dom_inp: &dom_inp };
             let inp_size = inp.num_elem();
             
-            if prog_size+selectors+inp_size>exprs.len() {
-                for i in exprs.len()..prog_size+selectors+inp_size {
-                    exprs.push(comp.var(CompVar(i)).unwrap());
+            if inp_size>exprs_inp.len() {
+                for i in exprs.len()+exprs_inp.len()..exprs.len()+inp_size {
+                    exprs_inp.push(comp.var(CompVar(i)).unwrap());
                 }
             }
             let mut cfg = FalcoCfg::new();
-            debug_assert_eq!(prog_size+inp_size,exprs.len());
             match translate_instr(&m,
                                   &mut cfg,
                                   lib,
@@ -308,34 +328,31 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                                   cf_id,
                                   instr_id,
                                   instr,
-                                  &st,
+                                  st,
                                   &inp,
-                                  Transformation::id(prog_size),
-                                  Transformation::view(prog_size,inp_size,Transformation::id(prog_size+inp_size)),
-                                  &exprs[..],
+                                  &mut exprs,&exprs_inp[..],
                                   &mut comp) {
-                Ok((nprog,trans)) => {
-                    debug_assert_eq!(nprog.num_elem(),trans.size());
+                Ok(()) => {
+                    debug_assert_eq!(st.num_elem(),exprs.len());
                     //println!("TR: {:#?}",trans);
-                    let nexprs = trans.get_all(&exprs[..],&mut comp).unwrap();
                     if cfg!(debug_assertions) {
-                        for (i,e) in nexprs.iter().enumerate() {
-                            let expected = nprog.elem_sort(i,&mut comp).unwrap();
+                        for (i,e) in exprs.iter().enumerate() {
+                            let expected = st.elem_sort(i,&mut comp).unwrap();
                             let got = comp.type_of(e).unwrap();
                             if expected!=got {
                                 println!("Warning: At expression {}({:?}), expected: {}, got: {} ({})",
-                                         i,nprog.meaning(i),expected,got,e);
+                                         i,st.meaning(i),expected,got,e);
                             }
                         }
                     }
                     let (ndom1,ndom2) = {
-                        let d1 = domain_derive1.derive(&nexprs[..],&mut comp,
+                        let d1 = domain_derive1.derive(&exprs[..],&mut comp,
                                                        &|v| if v.0 < prog_size {
                                                            Some(v.0)
                                                        } else {
                                                            None
                                                        }).unwrap();
-                        let d2 = domain_derive2.derive(&nexprs[..],&mut comp,
+                        let d2 = domain_derive2.derive(&exprs[..],&mut comp,
                                                        &|v| if v.0 < prog_size {
                                                            Some(v.0)
                                                        } else {
@@ -344,23 +361,16 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                         (d1,d2)
                     };
                     if cfg!(debug_assertions) {
-                        for i in 0..nexprs.len() {
+                        for i in 0..exprs.len() {
                             match ndom2.is_const(&comp.var(CompVar(i)).unwrap(),&mut comp,
                                                  &|v| Some(v.0)).unwrap() {
-                                None => panic!("Expression {} ({:?}) is not const in full domain",i,nexprs[i]),
+                                None => panic!("Expression {} ({:?}) is not const in full domain",i,exprs[i]),
                                 Some(_) => {}
                             }
                         }
                     }
-                    let mut extras = Vec::with_capacity(cfg.extra_sel.len());
-                    for extr in cfg.extra_sel.iter() {
-                        extras.push(extr.get(&exprs[..],0,&mut comp).unwrap())
-                    }
-                    let cond = match cfg.condition(&mut comp).unwrap() {
-                        None => None,
-                        Some(c) => Some(c.get(&exprs[..],0,&mut comp).unwrap())
-                    };
-                    return (nprog,inp.clone(),nexprs,cond,ndom1,ndom2,extras)
+                    let (cond,extra) = cfg.condition(&mut comp).unwrap();
+                    return (inp.clone(),exprs,cond,ndom1,ndom2,extra)
                 },
                 Err(TrErr::InputNeeded(ninp)) => ninp,
                 _ => panic!("AAA")
@@ -370,7 +380,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
     }
 }
 
-type Selectors<Em : Embed> = HashMap<(u64,u64),Em::Var>;
+type Selectors<Em: Embed> = HashMap<(u64,u64),Em::Var>;
 
 fn get_dbg_loc(instr: &Instruction,m: &Module) -> Option<(u64,u64)> {
     match instr.metadata.get("dbg") {
@@ -382,7 +392,8 @@ fn get_dbg_loc(instr: &Instruction,m: &Module) -> Option<(u64,u64)> {
     }
 }
 
-fn make_selectors<B : Backend>(m: &Module,b: &mut B) -> Result<Selectors<B>,B::Error> {
+fn make_selectors<B: Backend>(m: &Module,b: &mut B)
+                              -> Result<Selectors<B>,B::Error> {
     let mut selectors = HashMap::new();
     for fun in m.functions.values() {
         if let Some(ref bdy) = fun.body {
@@ -416,8 +427,8 @@ macro_rules! debug {
     }
 }
 
-struct TraceUnwinding<'a,R : io::Read,Em : Embed,V : Semantic+Bytes+FromConst<'a>,Dom>
-    where Em : 'a,Em::Var : 'a {
+struct TraceUnwinding<'a,R: io::Read,Em: Embed,V: Semantic+Bytes<'a>+FromConst<'a>,Dom>
+    where Em: 'a,Em::Var: 'a {
     reader: falco::StepReader<'a,R>,
     step_buffer: Option<falco::Step<'a>>,
     selectors: &'a Selectors<Em>,
@@ -435,7 +446,7 @@ struct TraceUnwinding<'a,R : io::Read,Em : Embed,V : Semantic+Bytes+FromConst<'a
 
 /// A translated graph node
 #[derive(Clone)]
-struct TNode<'a,V : Bytes+FromConst<'a>+Semantic,Em : Embed,Dom> {
+struct TNode<'a,V: Bytes<'a>+FromConst<'a>+Semantic,Em: Embed,Dom> {
     prog: Program<'a,V>,
     prog_inp: Vec<Em::Expr>,
     domain: Dom,
@@ -444,14 +455,14 @@ struct TNode<'a,V : Bytes+FromConst<'a>+Semantic,Em : Embed,Dom> {
 }
 
 #[derive(Clone)]
-enum TStatus<'a,V : Bytes+FromConst<'a>+Semantic,Em : Embed,Dom> {
+enum TStatus<'a,V: Bytes<'a>+FromConst<'a>+Semantic,Em : Embed,Dom> {
     Untranslated,
     Translated(Box<TNode<'a,V,Em,Dom>>),
     Finished
 }
 
-struct GraphUnwinding<'a,Em : 'a+Embed,V : Semantic+Bytes+FromConst<'a>,Dom>
-    where Em::Var : 'a {
+struct GraphUnwinding<'a,Em: 'a+Embed,V: Semantic+Bytes<'a>+FromConst<'a>,Dom>
+    where Em::Var: 'a {
     module: &'a Module,
     backend: &'a mut Em,
     selectors: &'a Selectors<Em>,
@@ -463,39 +474,39 @@ struct GraphUnwinding<'a,Em : 'a+Embed,V : Semantic+Bytes+FromConst<'a>,Dom>
     debugging: u64
 }
 
-struct FalcoLib<'a : 'b,'b> {
+struct FalcoLib<'a: 'b,'b> {
     ext: &'b falco::External<'a>
 }
 
-impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em : DeriveValues> Library<'a,V,Em> for FalcoLib<'a,'b> {
-    fn call<RetV>(&self,
-                  fname: &'a String,
-                  args: &Vec<V>,
-                  args_inp: Transf<Em>,
-                  ret_view: Option<RetV>,
-                  _: &'a DataLayout,
-                  _: InstructionRef<'a>,
-                  conds: &mut Vec<Transf<Em>>,
-                  _: &Program<'a,V>,
-                  prog_inp: Transf<Em>,
-                  nprog: &mut Program<'a,V>,
-                  updates: &mut Updates<Em>,
-                  _: &[Em::Expr],
-                  em: &mut Em)
-                  -> Result<bool,Em::Error>
-        where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
+impl<'a,'b,V: 'a+Bytes<'a>+FromConst<'a>+IntValue<'a>,Em: DeriveValues> Library<'a,V,Em> for FalcoLib<'a,'b> {
+    fn call<FromArg,Arg: Path<'a,Em,FromArg,To=CompVec<V>>,
+            Ret: Path<'a,Em,Program<'a,V>,To=Assoc<&'a String,V>>
+            >(&self,
+              fname: &'a String,
+              args: &Arg,
+              args_from: &FromArg,
+              args_inp: &[Em::Expr],
+              ret: Option<(Ret,&'a String)>,
+              _: &'a DataLayout,
+              _: InstructionRef<'a>,
+              prog: &mut Program<'a,V>,
+              prog_inp: &mut Vec<Em::Expr>,
+              conds: &mut Vec<Em::Expr>,
+              em: &mut Em)
+              -> Result<bool,Em::Error> {
         if *fname!=*self.ext.function {
             return Ok(false)
         }
-        for (ext,(arg,arg_inp)) in self.ext.args.iter().zip(
-            vec_iter(OptRef::Ref(args),args_inp)
+        for (ext,arg) in self.ext.args.iter().zip(
+            CompVec::elements(args.clone(),args_from)
         ) {
             match ext {
                 &None => {},
                 &Some(falco::Val::Int { bw, ref val }) => {
-                    let (eval,eval_inp) = V::const_int(bw,val.clone(),em)?;
-                    let eq = comp_eq(&eval,Transformation::constant(eval_inp),
-                                     arg.as_ref(),arg_inp,em)?.unwrap();
+                    let mut eval_inp = Vec::new();
+                    let eval = V::const_int(bw,val.clone(),&mut eval_inp,em)?;
+                    let eq = comp_eq(&Id,&eval,&eval_inp[..],
+                                     &arg,args_from,args_inp,em)?.unwrap();
                     conds.push(eq);
                 },
                 _ => {}
@@ -506,12 +517,21 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em : DeriveValues> Library<'a,V,E
             None => {}
             Some(ref rval) => match rval {
                 &falco::Val::Int { bw,ref val } => {
-                    let (i,i_inp) = V::const_int(bw,val.clone(),em)?;
-                    match ret_view {
-                        None => panic!("Trace has a return value but the function doesn't..."),
-                        Some(ret_view_) => {
-                            ret_view_.insert_cond(nprog,i,Transformation::constant(i_inp),
-                                                  conds,updates,prog_inp,em)?
+                    let mut i_inp = Vec::new();
+                    let i = V::const_int(bw,val.clone(),&mut i_inp,em)?;
+                    match ret {
+                        None => panic!("Trace has a return value but the function doesn't."),
+                        Some((ref ret_,name)) => {
+                            if conds.len()==0 {
+                                Assoc::insert(ret_,prog,prog_inp,
+                                              name,i,&mut i_inp,em)?;
+                            } else {
+                                let rcond = em.and(conds.clone())?;
+                                Assoc::insert_cond(ret_.clone(),
+                                                   prog,prog_inp,
+                                                   name,i,&mut i_inp,
+                                                   &rcond,em)?;
+                            }
                         }
                     }
                 },
@@ -522,65 +542,74 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em : DeriveValues> Library<'a,V,E
     }
 }
 
-struct FalcoMultiLib<'a : 'b,'b> {
+struct FalcoMultiLib<'a: 'b,'b> {
     exts: &'b Vec<(usize,falco::External<'a>)>,
     sel_offset: usize
 }
 
-impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em> Library<'a,V,Em> for FalcoMultiLib<'a,'b>
+impl<'a,'b,V: 'a+Bytes<'a>+FromConst<'a>+IntValue<'a>,Em> Library<'a,V,Em> for FalcoMultiLib<'a,'b>
     where Em : DeriveValues<Var=CompVar> {
-    fn call<RetV>(&self,
-                  fname: &'a String,
-                  args: &Vec<V>,
-                  args_inp: Transf<Em>,
-                  ret_view: Option<RetV>,
-                  _: &'a DataLayout,
-                  _: InstructionRef<'a>,
-                  conds: &mut Vec<Transf<Em>>,
-                  _: &Program<'a,V>,
-                  prog_inp: Transf<Em>,
-                  nprog: &mut Program<'a,V>,
-                  updates: &mut Updates<Em>,
-                  _: &[Em::Expr],
-                  em: &mut Em)
-                  -> Result<bool,Em::Error>
-        where RetV : ViewInsert<Viewed=Program<'a,V>,Element=V>+ViewMut {
+    fn call<FromArg,Arg: Path<'a,Em,FromArg,To=CompVec<V>>,
+            Ret: Path<'a,Em,Program<'a,V>,To=Assoc<&'a String,V>>
+            >(&self,
+              fname: &'a String,
+              args: &Arg,
+              args_from: &FromArg,
+              args_arr: &[Em::Expr],
+              ret: Option<(Ret,&'a String)>,
+              _: &'a DataLayout,
+              _: InstructionRef<'a>,
+              prog: &mut Program<'a,V>,
+              prog_arr: &mut Vec<Em::Expr>,
+              conds: &mut Vec<Em::Expr>,
+              em: &mut Em)
+              -> Result<bool,Em::Error> {
         let mut act_conds = Vec::new();
         let cpos = conds.len();
         for &(tr_nr,ref ext) in self.exts.iter() {
             let sel_e = em.embed(expr::Expr::Var(CompVar(self.sel_offset+tr_nr)))?;
-            conds.push(Transformation::constant(vec![sel_e.clone()]));
+            conds.push(sel_e.clone());
             if *fname!=*ext.function {
                 panic!("External function doesn't match code")
             }
-            let mut eq_conds = vec![Transformation::constant(vec![sel_e])];
-            for (ext_arg,(arg,arg_inp)) in ext.args.iter().zip(
-                vec_iter(OptRef::Ref(args),args_inp.clone())
+            let mut eq_conds = vec![sel_e];
+            for (ext_arg,arg) in ext.args.iter().zip(
+                CompVec::elements(args.clone(),args_from)
             ) {
                 match ext_arg {
                     &None => {},
                     &Some(falco::Val::Int { bw, ref val }) => {
-                        let (eval,eval_inp) = V::const_int(bw,val.clone(),em)?;
-                        let eq = comp_eq(&eval,Transformation::constant(eval_inp),
-                                         arg.as_ref(),arg_inp,em)?.unwrap();
+                        let mut eval_inp = Vec::new();
+                        let eval = V::const_int(bw,val.clone(),&mut eval_inp,em)?;
+                        let eq = comp_eq(&Id,&eval,&eval_inp[..],
+                                         &arg,args_from,args_arr,em)?.unwrap();
                         eq_conds.push(eq);
                     },
                     _ => {}
                 }
             }
-            let eq_cond = Transformation::and(eq_conds);
+            let eq_cond = em.and(eq_conds)?;
             act_conds.push(eq_cond);
             //assert!(self.ext.args.iter().all(Option::is_none));
             match ext.ret {
                 None => {}
                 Some(ref rval) => match rval {
                     &falco::Val::Int { bw,ref val } => {
-                        let (i,i_inp) = V::const_int(bw,val.clone(),em)?;
-                        match ret_view {
+                        let mut i_inp = Vec::new();
+                        let i = V::const_int(bw,val.clone(),&mut i_inp,em)?;
+                        match ret {
                             None => panic!("Trace has a return value but the function doesn't..."),
-                            Some(ref ret_view_) => {
-                                ret_view_.insert_cond(nprog,i,Transformation::constant(i_inp),
-                                                      conds,updates,prog_inp.clone(),em)?
+                            Some((ref ret_,name)) => {
+                                if conds.len()==0 {
+                                    Assoc::insert(ret_,prog,prog_arr,
+                                                  name,i,&mut i_inp,em)?;
+                                } else {
+                                    let rcond = em.and(conds.clone())?;
+                                    Assoc::insert_cond(ret_.clone(),
+                                                       prog,prog_arr,
+                                                       name,i,&mut i_inp,
+                                                       &rcond,em)?;
+                                }
                             }
                         }
                     },
@@ -589,7 +618,7 @@ impl<'a,'b,V : 'a+Bytes+FromConst<'a>+IntValue,Em> Library<'a,V,Em> for FalcoMul
             }
             conds.truncate(cpos);
         }
-        let act_cond = Transformation::or(act_conds);
+        let act_cond = em.or(act_conds)?;
         conds.push(act_cond);
         Ok(true)
     }
@@ -619,9 +648,9 @@ fn use_full_domain(instr: &llvm_ir::Instruction) -> bool {
 }
 
 
-impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwinding<'a,R,Em,V,Dom>
-    where V : 'a+Bytes+FromConst<'a>+Pointer<'a>+IntValue+Vector+FromMD<'a>+Debug+Semantic,
-          Em::Expr : Display {
+impl<'a,R: io::Read,Em: Backend,V,Dom: Domain<Program<'a,V>>+Clone> TraceUnwinding<'a,R,Em,V,Dom>
+    where V: 'a+Bytes<'a>+FromConst<'a>+Pointer<'a>+IntValue<'a>+Vector<'a>+FromMD<'a>+Debug+Semantic,
+          Em::Expr: Display {
     pub fn new(inp: R,
                sel: &'a Selectors<Em>,
                m: &'a Module,
@@ -649,31 +678,36 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
             }
         };
         let (ptr_bw,_,_) = m.datalayout.pointer_alignment(0);
-        let (argc,argc_inp) = V::const_int(argc_bw,BigUint::from(args.len()),b)?;
-        let (argv0,argv0_inp) = choice_empty();
-        let (argv1,argv1_inp) = choice_insert(OptRef::Owned(argv0),argv0_inp,
-                                              Transformation::const_bool(true,b)?,
-                                              OptRef::Owned((PointerTrg::AuxArray,
-                                                             (Data((0,(ptr_bw/8) as usize)),None))),
-                                              Transformation::id(0))?;
-        let (argv,argv_inp) = V::from_pointer((ptr_bw/8) as usize,argv1,argv1_inp);
-        let (args0,args0_inp) = choice_empty();
-        let (args1,args1_inp) = choice_insert(OptRef::Owned(args0),args0_inp,
-                                              Transformation::const_bool(true,b)?,
-                                              OptRef::Owned(Data(args)),
-                                              Transformation::id(0))?;
-        let (prog,prog_inp) = translate_init(m,fun,
-                                             vec![argc,argv.as_obj()],
-                                             Transformation::concat(&[Transformation::constant(argc_inp),argv_inp]),
-                                             args1.as_obj(),args1_inp,
-                                             b)?;
-        let init_exprs = prog_inp.get_all(&[][..],b)?;
+
+        let mut prog_inp = Vec::new();
+        let args_len = args.len();
+        let prog = translate_init(
+            m,fun,
+            |res,em| CompVec::construct(
+                0..1,
+                |n,res,em| {
+                    match n {
+                        0 => V::const_int(argc_bw,BigUint::from(args_len),res,em),
+                        1 => {
+                            let mut argv_inp = Vec::new();
+                            let argv = Choice::singleton(
+                                |res,em| Ok((PointerTrg::AuxArray,(Data((0,(ptr_bw/8) as usize)),None))),
+                                &mut argv_inp,em)?;
+                            V::from_pointer((ptr_bw/8) as usize,&Id,&argv,&argv_inp[..],res,em)
+                        },
+                        _ => unreachable!()
+                    }
+                },res,em),
+            |res,em| Choice::singleton(
+                |_,_| Ok(Data(args)),
+                res,em),
+            &mut prog_inp,b)?;
         // FIXME: This should reference (), but that is not possible in Rust
-        let dom_none : Dom = Dom::full(prog.as_ref());
-        let dom_init = <Dom as Domain<Program<V>>>::derive(&dom_none,&init_exprs,b,
+        let dom_none : Dom = Dom::full(&prog);
+        let dom_init = <Dom as Domain<Program<V>>>::derive(&dom_none,&prog_inp[..],b,
                                                            &|_| { unreachable!() })?;
-        let mut meaning = Vec::with_capacity(init_exprs.len());
-        for m in Semantics::new(prog.as_ref()) {
+        let mut meaning = Vec::with_capacity(prog_inp.len());
+        for m in Semantics::new(&prog) {
             meaning.push(m);
         }
         //println!("Program: {:#?}",prog.as_ref());
@@ -683,8 +717,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                             backend: b,
                             module: m,
                             main: fun,
-                            program: prog.as_obj(),
-                            program_input: init_exprs,
+                            program: prog,
+                            program_input: prog_inp,
                             program_meaning: meaning,
                             domain: dom_init.clone(),
                             domain_full: dom_init,
@@ -720,11 +754,12 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                instr_ref.instruction);
         debug!(self,3,"Content: {:?}",instr);
         let use_full = use_full_domain(instr);
-        let (mut nprog,ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel)
+        let mut nprog = self.program.clone();
+        let (ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel)
             = match entr.ext {
                 falco::CallKind::Internal => {
                     let lib = StdLib {};
-                    step(self.module,&lib,&self.program,0,
+                    step(self.module,&lib,&mut nprog,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -736,7 +771,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                 },
                 falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
-                    step(self.module,&lib,&self.program,0,
+                    step(self.module,&lib,&mut nprog,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -747,7 +782,7 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          thr_id,entr.id.call_id,instr_ref)
                 } else {
                     let lib = FalcoLib { ext: ext };
-                    step(self.module,&lib,&self.program,0,
+                    step(self.module,&lib,&mut nprog,0,
                          if use_full {
                              &self.domain_full
                          } else {
@@ -865,10 +900,10 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
     }
 }
 
-impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
-    where V : 'a+Semantic+Bytes+FromConst<'a>+IntValue+Pointer<'a>+FromMD<'a>+Vector+Debug,
-          Dom : Domain<Program<'a,V>>+Clone,
-          Em::Expr : Display {
+impl<'a,Em: 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
+    where V: 'a+Semantic+Bytes<'a>+FromConst<'a>+IntValue<'a>+Pointer<'a>+FromMD<'a>+Vector<'a>+Debug,
+          Dom: Domain<Program<'a,V>>+Clone,
+          Em::Expr: Display {
     pub fn new(m: &'a Module,
                b: &'a mut Em,
                selectors: &'a Selectors<Em>,
@@ -925,50 +960,81 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                            fun,rfun.arguments.len())
                 }
             };
-            let mut argc = None;
-            let (aux0,aux_inp0) = choice_empty();
-            let mut aux = OptRef::Owned(aux0);
-            let mut aux_inp = aux_inp0;
+            let mut argc: Option<(V,Vec<Em::Expr>)> = None;
+            let mut aux_inp = Vec::new();
+            let mut aux = Choice::empty(&mut aux_inp,self.backend)?;
+            
             let (ptr_bw,_,_) = self.module.datalayout.pointer_alignment(0);
-            let (argv0,argv0_inp) = choice_empty();
+
+            /*let (argv0,argv0_inp) = choice_empty();
             let (argv1,argv1_inp) = choice_insert(OptRef::Owned(argv0),argv0_inp,
                                                   Transformation::const_bool(true,self.backend)?,
                                                   OptRef::Owned((PointerTrg::AuxArray,
                                                                  (Data((0,(ptr_bw/8) as usize)),None))),
                                                   Transformation::id(0))?;
-            let (argv,argv_inp) = V::from_pointer((ptr_bw/8) as usize,argv1,argv1_inp);
+            let (argv,argv_inp) = V::from_pointer((ptr_bw/8) as usize,argv1,argv1_inp);*/
             let mut inp = Vec::with_capacity(starts);
+
             for (n,start) in nxt_nd.start.iter().enumerate() {
+                let sel_var = self.trace_selector[*start].clone();
+                let cond = self.backend.var(sel_var)?;
                 let arg = &self.trace_args[*start];
                 let nargc = {
-                    let (cargc,cargc_inp) = V::const_int(argc_bw,BigUint::from(arg.len()),self.backend)?;
+                    let mut cargc_inp = Vec::new();
+                    let cargc = V::const_int(argc_bw,BigUint::from(arg.len()),
+                                             &mut cargc_inp,self.backend)?;
                     match argc {
-                        None => (OptRef::Owned(cargc),Transformation::constant(cargc_inp)),
-                        Some((oargc,oargc_inp)) => ite(OptRef::Owned(cargc),oargc,
-                                                       Transformation::view(n,1,Transformation::id(starts)),
-                                                       Transformation::constant(cargc_inp),
-                                                       oargc_inp,self.backend)?.unwrap()
+                        None => (cargc,cargc_inp),
+                        Some((oargc,oargc_inp)) => {
+                            let mut nargc_inp = Vec::new();
+                            let nargc = ite(&cond,
+                                            &Id,&cargc,&cargc_inp[..],
+                                            &Id,&oargc,&oargc_inp[..],
+                                            &mut nargc_inp,
+                                            self.backend)?.unwrap();
+                            (nargc,nargc_inp)
+                        }
                     }
                 };
-                let (naux,naux_inp) = choice_insert(aux,aux_inp,
-                                                    Transformation::view(n,1,Transformation::id(starts)),
-                                                    OptRef::Owned(Data(arg.clone())),Transformation::id(0))?;
-                aux = naux;
-                aux_inp = naux_inp;
+                Choice::insert(&Id,&mut aux,&mut aux_inp,
+                               Data(arg.clone()),&mut Vec::new(),
+                               cond.clone(),self.backend)?;
                 argc = Some(nargc);
-                let sel_var = self.trace_selector[*start].clone();
-                inp.push(self.backend.embed(expr::Expr::Var(sel_var))?);
+                
+                inp.push(cond);
             }
             let (argc_,argc_inp) = argc.unwrap();
-            let (prog,prog_inp) = translate_init(self.module,fun,
-                                                 vec![argc_.as_obj(),argv.as_obj()],
-                                                 Transformation::concat(&[argc_inp,argv_inp]),
-                                                 aux.as_obj(),aux_inp,
-                                                 self.backend)?;
-            let init_exprs = prog_inp.get_all(&inp[..],self.backend)?;
-            let dom_none : Dom = Dom::full(prog.as_ref());
+
+            let mut prog_inp = Vec::new();
+            let prog = translate_init(
+                self.module,fun,
+                |res,em| CompVec::construct(
+                    0..1,
+                    |n,res,em| match n {
+                        0 => {
+                            res.extend_from_slice(&argc_inp[..]);
+                            Ok(argc_.clone())
+                        },
+                        1 => {
+                            let mut argv_inp = Vec::new();
+                            let argv = Choice::singleton(
+                                |res,em| Ok((PointerTrg::AuxArray,
+                                             (Data((0,(ptr_bw/8) as usize)),None))),
+                                &mut argv_inp,em)?;
+                            V::from_pointer((ptr_bw/8) as usize,
+                                            &Id,&argv,&argv_inp[..],res,em)
+                        },
+                        _ => unreachable!()
+                    },res,em),
+                |res,em| {
+                    res.append(&mut aux_inp);
+                    Ok(aux)
+                },
+                &mut prog_inp,self.backend)?;
+                    
+            let dom_none: Dom = Dom::full(&prog);
             let dom_init = <Dom as Domain<Program<V>>>::derive(
-                &dom_none,&init_exprs,self.backend,
+                &dom_none,&prog_inp[..],self.backend,
                 &|_| { None }
             )?;
             let mut path_sels = Vec::with_capacity(starts);
@@ -976,7 +1042,7 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                 path_sels.push(self.backend.embed(expr::Expr::Var(self.trace_selector[*start].clone()))?);
             }
             let path_cond = vec![self.backend.or(path_sels)?];
-            (prog.as_obj(),init_exprs,dom_init.clone(),dom_init,path_cond)
+            (prog,prog_inp,dom_init.clone(),dom_init,path_cond)
         } else {
             let mut incoming = self.graph.neighbors_directed(nxt_nd_id,
                                                              Direction::Incoming);
@@ -988,10 +1054,10 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                 TStatus::Untranslated => panic!("Incoming node is untranslated"),
                 TStatus::Finished => panic!("Incoming node is finished")
             };
-            let mut prog = OptRef::Ref(&first.prog);
-            let mut prog_inp = OptRef::Ref(&first.prog_inp);
-            let mut dom = OptRef::Ref(&first.domain);
-            let mut dom_full = OptRef::Ref(&first.domain_full);
+            let mut prog = first.prog.clone();
+            let mut prog_inp = first.prog_inp.clone();
+            let mut dom = first.domain.clone();
+            let mut dom_full = first.domain_full.clone();
             let mut path_cond = first.path_cond.clone();
             let mut one_inc = true;
             for inc_id in incoming {
@@ -1005,7 +1071,7 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                     TStatus::Untranslated => panic!("Incoming node is untranslated"),
                     TStatus::Finished => panic!("Incoming node is finished")
                 };
-                let (nprog,nprog_inp,ndom,ndom_full,cond) = merge_edge(prog,prog_inp,dom,dom_full,inc,self.backend)?;
+                let (nprog,nprog_inp,ndom,ndom_full,cond) = merge_edge(&prog,&prog_inp[..],&dom,&dom_full,inc,self.backend)?;
                 prog = nprog;
                 prog_inp = nprog_inp;
                 dom = ndom;
@@ -1019,7 +1085,7 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                 let ncond_def = self.backend.define(ncond)?;
                 vec![ncond_def]
             };
-            (prog.as_obj(),prog_inp.as_obj(),dom.as_obj(),dom_full.as_obj(),rpath_cond)
+            (prog,prog_inp,dom,dom_full,rpath_cond)
         };
         let fun = self.module.functions.get(nxt_nd.id.fun)
             .expect("Function not found");
@@ -1039,10 +1105,11 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                instr_ref.instruction);
         debug!(self,3,"Content: {:?}",instr);
         let use_full = use_full_domain(instr);
-        let (nprog,ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel) = match nxt_nd.ext {
+        let mut nprog = prog.clone();
+        let (ninp,nprog_inp,act,mut ndom,ndom_full,extra_sel) = match nxt_nd.ext {
             MultiCallKind::Internal => {
                 let lib = StdLib {};
-                step(self.module,&lib,&prog,self.trace_selector.len(),
+                step(self.module,&lib,&mut nprog,self.trace_selector.len(),
                      if use_full {
                          &dom_full
                      } else {
@@ -1057,7 +1124,7 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                     exts: exts,
                     sel_offset: prog_inp.len()
                 };
-                step(self.module,&lib,&prog,self.trace_selector.len(),
+                step(self.module,&lib,&mut nprog,self.trace_selector.len(),
                      if use_full {
                          &dom_full
                      } else {
@@ -1207,80 +1274,77 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
     }
 }
 
-fn merge_edge<'a,'b,V,Em,Dom>(
-    prog: OptRef<'b,Program<'a,V>>,
-    prog_inp: OptRef<'b,Vec<Em::Expr>>,
-    dom: OptRef<'b,Dom>,
-    dom_full: OptRef<'b,Dom>,
+fn merge_edge<'a,V,Em,Dom>(
+    prog: &Program<'a,V>,
+    prog_inp: &[Em::Expr],
+    dom: &Dom,
+    dom_full: &Dom,
     inc: &TNode<'a,V,Em,Dom>,
     em: &mut Em
-) -> Result<(OptRef<'b,Program<'a,V>>,
-             OptRef<'b,Vec<Em::Expr>>,
-             OptRef<'b,Dom>,
-             OptRef<'b,Dom>,
+) -> Result<(Program<'a,V>,
+             Vec<Em::Expr>,
+             Dom,
+             Dom,
              Em::Expr),Em::Error>
     where
-    V: Bytes+FromConst<'a>+Semantic+Debug,
+    V: 'a+Bytes<'a>+FromConst<'a>+Semantic+Debug,
     Dom: Domain<Program<'a,V>>,
     Em: Embed
 {
-    let cur_sz = prog_inp.as_ref().len();
+    let cur_sz = prog_inp.len();
     let inc_sz = inc.prog_inp.len();
-    let mut comp = Comp { referenced: (&BOOL_SINGLETON,
-                                       &inc.prog,
-                                       prog.as_ref()) };
-    let base = Transformation::id(cur_sz+inc_sz+1);
-    let (nprog,ninp) = ite(OptRef::Ref(&inc.prog),
-                           prog.to_ref(),
-                           Transformation::view(0,1,base.clone()),
-                           Transformation::view(1,inc_sz,
-                                                base.clone()),
-                           Transformation::view(1+inc_sz,cur_sz,
-                                                base.clone()),&mut comp).unwrap().unwrap();
+    let mut comp = Comp { referenced: (&SINGLETON_BOOL,
+                                       &inc.prog,prog) };
     let mut work = Vec::with_capacity(cur_sz+inc_sz+1);
     for i in 0..cur_sz+inc_sz+1 {
         work.push(comp.embed(expr::Expr::Var(CompVar(i))).unwrap());
     }
-    let res = ninp.get_all(&work[..],&mut comp).unwrap();
-    let ndom = Dom::derives(&res[..],&mut comp,&|&CompVar(n)| {
+    let cond = comp.embed(expr::Expr::Var(CompVar(0))).unwrap();
+    let mut ninp = Vec::new();
+    let nprog = ite(&cond,
+                    &then(Id,Offset::new(1)),&inc.prog,&work[..],
+                    &then(Id,Offset::new(1+inc_sz)),&prog,&work[..],
+                    &mut ninp,
+                    &mut comp).unwrap().unwrap();
+    let ndom = Dom::derives(&ninp[..],&mut comp,&|&CompVar(n)| {
         if n==0 {
             return None
         }
         if n<inc_sz+1 {
             return Some((&inc.domain,n-1))
         }
-        Some((dom.as_ref(),n-1-inc_sz))
+        Some((dom,n-1-inc_sz))
     }).unwrap();
-    let ndom_full = Dom::derives(&res[..],&mut comp,&|&CompVar(n)| {
+    let ndom_full = Dom::derives(&ninp[..],&mut comp,&|&CompVar(n)| {
         if n==0 {
             return None
         }
         if n<inc_sz+1 {
             return Some((&inc.domain_full,n-1))
         }
-        Some((dom_full.as_ref(),n-1-inc_sz))
+        Some((dom_full,n-1-inc_sz))
     }).unwrap();
-    let mut nprog_inp = Vec::with_capacity(res.len());
-    let cond = match inc.path_cond.len() {
+    let mut nprog_inp = Vec::with_capacity(ninp.len());
+    let rcond = match inc.path_cond.len() {
         0 => em.const_bool(true),
         1 => Ok(inc.path_cond[0].clone()),
         _ => em.and(inc.path_cond.clone())
     }?;
-    for e in res.iter() {
+    for e in ninp.iter() {
         let ne = e.translate(&mut |i,em| {
             if i==0 {
-                Ok(cond.clone())
+                Ok(rcond.clone())
             } else if i<inc_sz+1 {
                 Ok(inc.prog_inp[i-1].clone())
             } else {
-                Ok(prog_inp.as_ref()[i-1-inc_sz].clone())
+                Ok(prog_inp[i-1-inc_sz].clone())
             }
         },em)?;
         nprog_inp.push(ne);
     }
-    Ok((nprog.to_owned(),OptRef::Owned(nprog_inp),
-        OptRef::Owned(ndom),OptRef::Owned(ndom_full),
-        cond))
+    Ok((nprog,nprog_inp,
+        ndom,ndom_full,
+        rcond))
 }
 
 fn update_on_semantic_change<'a,C,D,It,Dom,Em,F>(new: &C,
@@ -1295,7 +1359,7 @@ fn update_on_semantic_change<'a,C,D,It,Dom,Em,F>(new: &C,
                                                  update: F)
                                                  -> Result<(),Em::Error> 
     where
-    C: Semantic+Composite,
+    C: Semantic+Composite<'a>,
     D: Semantic<Meaning=C::Meaning>,
     Dom: Domain<C>,
     F: Fn(&C::Meaning) -> bool,
