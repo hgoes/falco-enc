@@ -173,8 +173,12 @@ struct FalcoCfg<Em : Embed> {
 }
 
 impl<Em : Embed> FalcoCfg<Em> {
-    pub fn new() -> Self {
-        FalcoCfg { paths: Some(Vec::new()),
+    pub fn new(path_sensitive: bool) -> Self {
+        FalcoCfg { paths: if path_sensitive {
+            Some(Vec::new())
+        } else {
+            None
+        },
                    current_path: Vec::new(),
                    extra_sel: Vec::new() }
     }
@@ -256,7 +260,8 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                       domain_derive2: &Dom,
                       thread_id: ThreadId<'a>,
                       cf_id: CallId<'a>,
-                      instr_id: InstructionRef<'a>)
+                      instr_id: InstructionRef<'a>,
+                      path_sensitive: bool)
                       -> (Program<'a,V>,ProgramInput<'a,V>,
                           Vec<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
                           Option<CompExpr<(Program<'a,V>,ProgramInput<'a,V>)>>,
@@ -299,7 +304,7 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                     exprs.push(comp.var(CompVar(i)).unwrap());
                 }
             }
-            let mut cfg = FalcoCfg::new();
+            let mut cfg = FalcoCfg::new(path_sensitive);
             debug_assert_eq!(prog_size+inp_size,exprs.len());
             match translate_instr(&m,
                                   &mut cfg,
@@ -430,7 +435,8 @@ struct TraceUnwinding<'a,R : io::Read,Em : Embed,V : Semantic+Bytes+FromConst<'a
     domain: Dom,
     domain_full: Dom,
     path: Vec<Em::Expr>,
-    debugging: u64
+    debugging: u64,
+    path_sensitive: bool
 }
 
 /// A translated graph node
@@ -460,7 +466,8 @@ struct GraphUnwinding<'a,Em : 'a+Embed,V : Semantic+Bytes+FromConst<'a>,Dom>
     translation: Vec<TStatus<'a,V,Em,Dom>>,
     trace_selector: Vec<Em::Var>,
     trace_args: Vec<Vec<Vec<u8>>>,
-    debugging: u64
+    debugging: u64,
+    path_sensitive: bool
 }
 
 struct FalcoLib<'a : 'b,'b> {
@@ -627,7 +634,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                m: &'a Module,
                spec: &'a fun_spec::FunSpecs,
                b: &'a mut Em,
-               debug: u64) -> Result<Self,Em::Error> {
+               debug: u64,
+               path_sensitive: bool) -> Result<Self,Em::Error> {
         let (args,mut reader) = falco::StepReader::new(m,spec,inp);
         let step0 = match reader.next() {
             None => panic!("Trace must have at least one element"),
@@ -689,7 +697,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                             domain: dom_init.clone(),
                             domain_full: dom_init,
                             path: Vec::new(),
-                            debugging: debug })
+                            debugging: debug,
+                            path_sensitive: path_sensitive })
     }
     fn step<'b>(&'b mut self) -> bool {
         let entr = match self.step_buffer.take() {
@@ -732,7 +741,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.id.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref,
+                         self.path_sensitive)
                 },
                 falco::CallKind::External(ref ext) => if ext.function=="realloc" || ext.function=="malloc" {
                     let lib = StdLib {};
@@ -744,7 +754,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.id.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref,
+                         self.path_sensitive)
                 } else {
                     let lib = FalcoLib { ext: ext };
                     step(self.module,&lib,&self.program,0,
@@ -755,7 +766,8 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                          },
                          &self.domain,
                          &self.domain_full,
-                         thr_id,entr.id.call_id,instr_ref)
+                         thr_id,entr.id.call_id,instr_ref,
+                         self.path_sensitive)
                 }
             };
         let num_inp = ninp.num_elem();
@@ -874,7 +886,8 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                selectors: &'a Selectors<Em>,
                gr: FalcoGraph<'a>,
                args: Vec<Vec<Vec<u8>>>,
-               debugging: u64) -> Result<Self,Em::Error> {
+               debugging: u64,
+               path_sensitive: bool) -> Result<Self,Em::Error> {
         let qs = match toposort(&gr,None) {
             Ok(r) => r,
             Err(_) => panic!("Unwinding graph contains cycles")
@@ -899,7 +912,8 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
             translation: transl,
             trace_selector: sels,
             trace_args: args,
-            debugging: debugging
+            debugging: debugging,
+            path_sensitive: path_sensitive
         })
     }
     pub fn step(&mut self) -> Result<bool,Em::Error> {
@@ -1050,7 +1064,8 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                      },
                      &dom,
                      &dom_full,
-                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref)
+                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref,
+                     self.path_sensitive)
             },
             MultiCallKind::External(ref exts) => {
                 let lib = FalcoMultiLib {
@@ -1065,7 +1080,8 @@ impl<'a,Em : 'a+Backend,V,Dom> GraphUnwinding<'a,Em,V,Dom>
                      },
                      &dom,
                      &dom_full,
-                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref)
+                     nxt_nd.id.thread_id,nxt_nd.id.call_id,instr_ref,
+                     self.path_sensitive)
             }
         };
         let num_inp = ninp.num_elem();
@@ -1345,6 +1361,7 @@ fn main() {
                          (@arg bmc: -b --bmc "Encode all traces into one BMC instance")
                          (@arg fun_spec: -f --fun_spec <FILE> !required +takes_value "Use a tracing specification file")
                          (@arg debug: -d --debug !required +multiple "Add extra debugging information to the trace")
+                         (@arg vermeer: --vermeer !required "Be path-insensitive")
                          (@arg llvm_file: +required "The LLVM file")
                          (@arg trace: +required +multiple "The trace file")
     );
@@ -1355,6 +1372,7 @@ fn main() {
     let m = parse_module(llvm_file).expect("Cannot parse llvm module");
     //println!("Module: {:#?}",m);
     let debugging = args.occurrences_of("debug");
+    let path_sensitive = args.is_present("vermeer");
     let fun_spec = match args.value_of("fun_spec") {
         None => fun_spec::FunSpecs::empty(),
         Some(file) => fun_spec::FunSpecs::read(file)
@@ -1374,7 +1392,7 @@ fn main() {
         }
         let gr = builder.finish();
         let mut unw : GraphUnwinding<_,Val,AttributeDomain<Const>>
-            = GraphUnwinding::new(&m,&mut p,&selectors,gr,all_args,debugging).unwrap();
+            = GraphUnwinding::new(&m,&mut p,&selectors,gr,all_args,debugging,path_sensitive).unwrap();
         while unw.step().unwrap() {}
         unw.declare_traces().unwrap();
     } else {
@@ -1384,7 +1402,7 @@ fn main() {
             p.comment(format!("Trace {}",nr).as_ref()).unwrap();
             let path = {
                 let mut unw : TraceUnwinding<_,_,Val,AttributeDomain<Const>>
-                    = TraceUnwinding::new(File::open(tr).unwrap(),&selectors,&m,&fun_spec,&mut p,debugging).unwrap();
+                    = TraceUnwinding::new(File::open(tr).unwrap(),&selectors,&m,&fun_spec,&mut p,debugging,path_sensitive).unwrap();
                 while unw.step() {
                 }
                 unw.path
