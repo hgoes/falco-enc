@@ -47,6 +47,7 @@ use petgraph::Direction;
 use petgraph::graph::{Graph,NodeIndex};
 use petgraph::algo::toposort;
 use std::vec::IntoIter;
+use std::ops::DerefMut;
 
 type Val<'a> = CompValue<ByteWidth<BasePointer<'a>>,BitVecValue>;
 
@@ -166,36 +167,120 @@ impl<'a,'b,V,DomProg,DomInp> DeriveValues for CompProgram<'a,'b,V,DomProg,DomInp
     }
 }
 
-struct FalcoCfg<Em : Embed> {
-    paths: Option<Vec<Transf<Em>>>,
-    current_path: Vec<Transf<Em>>,
-    extra_sel: Vec<Transf<Em>>
+trait FalcoConfig<Em: Embed>: TranslationCfg<Em> {
+    fn get_extras(&mut self,&mut Em) -> Result<Vec<Transf<Em>>,Em::Error>;
+    fn condition(&mut self,&mut Em) -> Result<Option<Transf<Em>>,Em::Error>;
 }
 
-impl<Em : Embed> FalcoCfg<Em> {
-    pub fn new(path_sensitive: bool) -> Self {
-        FalcoCfg { paths: if path_sensitive {
-            Some(Vec::new())
+enum FalcoCfg<Em: Embed> {
+    Sensitive(FalcoCfgSensitive<Em>),
+    Insensitive(FalcoCfgInsensitive<Em>)
+}
+
+impl<Em: Embed> FalcoCfg<Em> {
+    fn new(sensitive: bool, em: &mut Em) -> Result<Self,Em::Error> {
+        if sensitive {
+            Ok(FalcoCfg::Sensitive(FalcoCfgSensitive::new()))
         } else {
-            None
-        },
-                   current_path: Vec::new(),
-                   extra_sel: Vec::new() }
-    }
-    pub fn condition(self,em: &mut Em)
-                     -> Result<Option<Transf<Em>>,Em::Error> {
-        match self.paths {
-            None => Ok(None),
-            Some(mut paths) => match paths.len() {
-                0 => Ok(Some(Transformation::const_bool(false,em)?)),
-                1 => Ok(Some(paths.remove(0))),
-                _ => Ok(Some(Transformation::or(paths)))
-            }
+            let falc = FalcoCfgInsensitive::new(em)?;
+            Ok(FalcoCfg::Insensitive(falc))
         }
     }
 }
 
-impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
+impl<Em: Embed> TranslationCfg<Em> for FalcoCfg<Em> {
+    fn change_thread_activation(
+        &mut self,
+        conds: &mut Vec<Transf<Em>>,pos: usize,em: &mut Em)
+        -> Result<(),Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.change_thread_activation(conds,pos,em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.change_thread_activation(conds,pos,em)
+        }
+    }
+    fn change_context_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        -> Result<(),Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.change_context_activation(conds,pos,em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.change_context_activation(conds,pos,em)
+        }
+    }
+    fn change_call_frame_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        -> Result<(),Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.change_call_frame_activation(conds,pos,em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.change_call_frame_activation(conds,pos,em)
+        }
+    }
+    fn change_instr_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        -> Result<(),Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.change_instr_activation(conds,pos,em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.change_instr_activation(conds,pos,em)
+        }
+    }
+    fn change_instr_not_blocking(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        -> Result<(),Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.change_instr_not_blocking(conds,pos,em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.change_instr_not_blocking(conds,pos,em)
+        }
+    }
+}
+
+impl<Em: Embed> FalcoConfig<Em> for FalcoCfg<Em> {
+    fn get_extras(&mut self,em: &mut Em) -> Result<Vec<Transf<Em>>,Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.get_extras(em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.get_extras(em)
+        }
+    }
+    fn condition(&mut self,em: &mut Em)
+                 -> Result<Option<Transf<Em>>,Em::Error> {
+        match self {
+            &mut FalcoCfg::Sensitive(ref mut s) => s.condition(em),
+            &mut FalcoCfg::Insensitive(ref mut s) => s.condition(em)
+        }
+    }
+}
+
+struct FalcoCfgSensitive<Em : Embed> {
+    paths: Vec<Transf<Em>>,
+    current_path: Vec<Transf<Em>>,
+    extra_sel: Vec<Transf<Em>>
+}
+
+impl<Em: Embed> FalcoConfig<Em> for FalcoCfgSensitive<Em> {
+    fn get_extras(&mut self,em: &mut Em) -> Result<Vec<Transf<Em>>,Em::Error> {
+        Ok(self.extra_sel.clone())
+    }
+    fn condition(&mut self,em: &mut Em)
+                     -> Result<Option<Transf<Em>>,Em::Error> {
+        match self.paths.len() {
+            0 => Ok(Some(Transformation::const_bool(false,em)?)),
+            1 => Ok(Some(self.paths.remove(0))),
+            _ => Ok(Some(Transformation::or(self.paths.drain(..).collect())))
+        }
+    }
+}
+
+impl<Em : Embed> FalcoCfgSensitive<Em> {
+    pub fn new() -> Self {
+        FalcoCfgSensitive { paths: Vec::new(),
+                            current_path: Vec::new(),
+                            extra_sel: Vec::new() }
+    }
+}
+
+impl<Em : Embed> TranslationCfg<Em> for FalcoCfgSensitive<Em> {
     fn change_thread_activation(
         &mut self,
         conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
@@ -224,21 +309,8 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
         self.current_path.extend(conds.drain(pos..));
         let mut path = replace(&mut self.current_path,Vec::new());
         match path.len() {
-            0 => {
-                self.paths = None;
-            },
-            1 => match self.paths {
-                None => {},
-                Some(ref mut paths) => {
-                    paths.push(path.remove(0))
-                }
-            },
-            _ => match self.paths {
-                None => {},
-                Some(ref mut paths) => {
-                    paths.push(Transformation::and(path))
-                }
-            }
+            1 => self.paths.push(path.remove(0)),
+            _ => self.paths.push(Transformation::and(path))
         }
         Ok(())
     }
@@ -249,6 +321,75 @@ impl<Em : Embed> TranslationCfg<Em> for FalcoCfg<Em> {
         self.extra_sel.extend(conds.drain(pos..));
         Ok(())
     }
+}
+
+impl<Em : Embed> TranslationCfg<Em> for FalcoCfgInsensitive<Em> {
+    fn change_thread_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        -> Result<(),Em::Error> {
+        conds.drain(pos..);
+        Ok(())
+    }
+    fn change_context_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        -> Result<(),Em::Error> {
+        conds.drain(pos..);
+        Ok(())
+    }
+    fn change_call_frame_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        -> Result<(),Em::Error> {
+        conds.drain(pos..);
+        Ok(())
+    }
+    fn change_instr_activation(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,em:&mut Em)
+        -> Result<(),Em::Error> {
+        let arr = conds.drain(pos..).collect();
+        self.last_path = Transformation::and(arr);
+        Ok(())
+    }
+    fn change_instr_not_blocking(
+        &mut self,
+        conds:&mut Vec<Transf<Em>>,pos:usize,_:&mut Em)
+        -> Result<(),Em::Error> {
+        Ok(())
+    }
+}
+
+impl<Em: Embed> FalcoConfig<Em> for FalcoCfgInsensitive<Em> {
+    fn get_extras(&mut self,em: &mut Em) -> Result<Vec<Transf<Em>>,Em::Error> {
+        Ok(vec![])
+    }
+    fn condition(&mut self,em: &mut Em)
+                 -> Result<Option<Transf<Em>>,Em::Error> {
+        Ok(Some(self.last_path.clone()))
+    }
+
+}
+
+struct FalcoCfgInsensitive<Em : Embed> {
+    last_path: Transf<Em>
+}
+
+impl<Em: Embed> FalcoCfgInsensitive<Em> {
+    fn new(em: &mut Em) -> Result<Self,Em::Error> {
+        let p = Transformation::const_bool(false,em)?;
+        Ok(FalcoCfgInsensitive {
+            last_path: p
+        })
+    }
+}
+
+fn get_cfg<Em: 'static+Embed>(path_sensitive: bool,em: &mut Em) -> Result<Box<FalcoConfig<Em>>,Em::Error> {
+    let p = Transformation::const_bool(false,em)?;
+    Ok(Box::new(FalcoCfgInsensitive {
+        last_path: p
+    }) as Box<FalcoConfig<Em>>)
 }
 
 fn step<'a,Lib,V,Dom>(m: &'a Module,
@@ -304,7 +445,8 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                     exprs.push(comp.var(CompVar(i)).unwrap());
                 }
             }
-            let mut cfg = FalcoCfg::new(path_sensitive);
+            let mut cfg = FalcoCfgSensitive::new();
+            //let mut cfg = get_cfg(path_sensitive,&mut comp).unwrap();
             debug_assert_eq!(prog_size+inp_size,exprs.len());
             match translate_instr(&m,
                                   &mut cfg,
@@ -357,8 +499,9 @@ fn step<'a,Lib,V,Dom>(m: &'a Module,
                             }
                         }
                     }
-                    let mut extras = Vec::with_capacity(cfg.extra_sel.len());
-                    for extr in cfg.extra_sel.iter() {
+                    let extra_vec = cfg.get_extras(&mut comp).unwrap();
+                    let mut extras = Vec::with_capacity(extra_vec.len());
+                    for extr in extra_vec.iter() {
                         extras.push(extr.get(&exprs[..],0,&mut comp).unwrap())
                     }
                     let cond = match cfg.condition(&mut comp).unwrap() {
@@ -867,7 +1010,11 @@ impl<'a,R : io::Read,Em : Backend,V,Dom : Domain<Program<'a,V>>+Clone> TraceUnwi
                     Ok(cinp[n-prog_sz].clone())
                 },self.backend).unwrap();
                 debug!(self,2,"Activation: {}",nact);
-                self.path.push(nact);
+                if self.path_sensitive {
+                    self.path.push(nact);
+                } else {
+                    self.path = vec![nact];
+                }
             }
         }
         self.program_input = nprogram_input;
@@ -1372,7 +1519,7 @@ fn main() {
     let m = parse_module(llvm_file).expect("Cannot parse llvm module");
     //println!("Module: {:#?}",m);
     let debugging = args.occurrences_of("debug");
-    let path_sensitive = args.is_present("vermeer");
+    let path_sensitive = !args.is_present("vermeer");
     let fun_spec = match args.value_of("fun_spec") {
         None => fun_spec::FunSpecs::empty(),
         Some(file) => fun_spec::FunSpecs::read(file)
